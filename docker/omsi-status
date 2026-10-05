@@ -1,0 +1,11 @@
+#!/bin/sh
+# What the running server says about itself (its /status, as the players' server list reads
+# it): docker exec <container> omsi-status
+set -eu
+[ -f /tmp/openomsi/runtime.env ] || { echo "omsi-status: the server has not been started in this container" >&2; exit 1; }
+# shellcheck source=/dev/null
+. /tmp/openomsi/runtime.env
+# (one field a line: the image has no JSON tools)
+curl -fsS --max-time 5 "http://127.0.0.1:${OMSI_WEB_PORT}/status" \
+    | sed -e 's/^{/{\n  /' -e 's/,"/,\n  "/g' -e 's/}$/\n}/'
+echo

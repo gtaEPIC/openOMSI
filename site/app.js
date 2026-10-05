@@ -14,6 +14,7 @@ const DOCS = [
   { file: "ROUTES", title: "Routes", icon: "alt_route" },
   { file: "PLUGINS", title: "Plugins", icon: "extension" },
   { file: "SERVER", title: "Dedicated server", icon: "dns" },
+  { file: "DOCKER", title: "Docker server", icon: "inventory_2" },
   { file: "VERSIONING", title: "Versioning & releases", icon: "new_releases" },
 ];
 const PLATFORMS = [

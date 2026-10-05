@@ -1,0 +1,31 @@
+#!/bin/sh
+# Administer the running server from inside its container - the server takes admin commands
+# over the web port only from its own machine, never from outside (docs/SERVER.md):
+#
+#   docker exec <container> omsi-admin "say Hello everybody" "weather next"
+#
+# One command an argument, as the game's Administration menu sends them (say <text>,
+# kick <player id>, clock <seconds since midnight>, weather next, ...). Needs admin_password in
+# server.cfg (or OMSI_SERVER_ADMIN_PASSWORD) when the container started.
+set -eu
+[ -f /tmp/openomsi/runtime.env ] || { echo "omsi-admin: the server has not been started in this container" >&2; exit 1; }
+# shellcheck source=/dev/null
+. /tmp/openomsi/runtime.env
+if [ ! -f /tmp/openomsi/admin.hdr ]; then
+    echo "omsi-admin: the server has no admin password: set admin_password in server.cfg (or OMSI_SERVER_ADMIN_PASSWORD) and restart the container" >&2
+    exit 1
+fi
+if [ $# -eq 0 ]; then
+    echo "usage: omsi-admin \"say Hello\" [\"kick 3\" ...]" >&2
+    exit 2
+fi
+# (the password goes in a header from a file only this user can read, not on a command line)
+answer=$(printf '%s\n' "$@" | curl -sS --max-time 10 -H @/tmp/openomsi/admin.hdr --data-binary @- \
+    -w '\n%{http_code}' "http://127.0.0.1:${OMSI_WEB_PORT}/admin")
+code=$(printf '%s\n' "$answer" | tail -n 1)
+printf '%s\n' "$answer" | sed '$d'
+case "$code" in
+    202) exit 0 ;;
+    429) echo "(too many wrong passwords lately: wait a few minutes)" >&2 ;;
+esac
+exit 1

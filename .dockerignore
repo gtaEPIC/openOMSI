@@ -1,0 +1,16 @@
+# What the image build (Dockerfile) leaves out of the build context. .git stays: the build
+# stamps the version and commit from it, as the release builds do.
+target/
+dist/
+android/build/
+android/debug.keystore
+**/node_modules/
+.claude/
+.idea/
+.vscode/
+tools/greenteaspeak-plugin/*.zip
+# a server run from docker/ with the compose examples
+docker/.env
+docker/data/
+docker/spandau/
+docker/grundorf/

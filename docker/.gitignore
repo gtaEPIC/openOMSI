@@ -1,0 +1,6 @@
+# what running the compose examples from this folder leaves here: the servers' folders
+# (server.cfg, mods, the game's data) and the settings file
+/.env
+/data/
+/spandau/
+/grundorf/

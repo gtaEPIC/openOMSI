@@ -1,0 +1,92 @@
+# Several maps behind one web address (docs/DOCKER.md, "Several maps").
+#
+# A server plays one map, so each map gets a server of its own - all from the same read-only
+# OMSI 2 folder - and Caddy puts them under one address with HTTPS:
+#
+#   https://<OMSI_DOMAIN>/spandau   https://<OMSI_DOMAIN>/grundorf
+#
+# which the players add in openOMSI -> Multiplayer -> Servers; each shows its map and players
+# there. OMSI2_PATH, OMSI_DOMAIN and SERVER_NAME come from .env (see .env.example).
+#
+#   docker compose -f compose.multi.yaml up -d
+#
+# Another map: copy a server below (its name, map and folder changed) and add it to Caddyfile.
+# Each server keeps its whole map in memory: Berlin-Spandau about 1.2 GB, Grundorf 0.3 GB.
+name: openomsi-maps
+
+x-server: &server
+  image: ${OPENOMSI_IMAGE:-ghcr.io/gtaepic/openomsi-server:latest}
+  restart: unless-stopped
+  stop_grace_period: 30s
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-server-env: &server-env
+  TZ: ${TZ:-Etc/UTC}
+  # Caddy is the way in: no tunnel, no session codes, no router port forwarding
+  OMSI_SERVER_TUNNEL: "0"
+  OMSI_NO_BRIDGE: "1"
+
+services:
+  spandau:
+    <<: *server
+    environment:
+      <<: *server-env
+      OMSI_SERVER_NAME: ${SERVER_NAME:-openOMSI} - Berlin-Spandau
+      OMSI_SERVER_MAP: maps/Berlin-Spandau/global.cfg
+    volumes:
+      - type: bind
+        source: ${OMSI2_PATH:?set OMSI2_PATH in .env to your OMSI 2 folder}
+        target: /omsi2
+        read_only: true
+      - type: bind
+        source: ./spandau
+        target: /data
+        bind:
+          create_host_path: true
+    # Each server has a network of its own, so all of them keep the ports 27015/27025 inside
+    # and need none on the host: Caddy reaches them by name. To let players join one straight
+    # over UDP as well, give it ports of its own, the same inside and out:
+    # environment: OMSI_SERVER_PORT: "27016" and OMSI_SERVER_WEB_PORT: "27026" (Caddyfile: :27026)
+    # ports: ["27016:27016/udp", "27016:27016/tcp"]
+
+  grundorf:
+    <<: *server
+    environment:
+      <<: *server-env
+      OMSI_SERVER_NAME: ${SERVER_NAME:-openOMSI} - Grundorf
+      OMSI_SERVER_MAP: maps/Grundorf/global.cfg
+    volumes:
+      - type: bind
+        source: ${OMSI2_PATH:?set OMSI2_PATH in .env to your OMSI 2 folder}
+        target: /omsi2
+        read_only: true
+      - type: bind
+        source: ./grundorf
+        target: /data
+        bind:
+          create_host_path: true
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${PROXY_HTTP_PORT:-80}:80"
+      - "${PROXY_HTTPS_PORT:-443}:443"
+      - "${PROXY_HTTPS_PORT:-443}:443/udp"
+    environment:
+      OMSI_DOMAIN: ${OMSI_DOMAIN:?set OMSI_DOMAIN in .env (a domain, or http://localhost to try it out)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [spandau, grundorf]
+
+volumes:
+  caddy-data:
+  caddy-config:

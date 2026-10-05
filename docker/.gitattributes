@@ -1,0 +1,3 @@
+# Everything here runs or is read inside a Linux container: LF line ends whatever
+# core.autocrlf says (a script with CRLF ends fails there with "no such file or directory").
+* text eol=lf

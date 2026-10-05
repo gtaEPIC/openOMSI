@@ -1,0 +1,239 @@
+# The dedicated server's container image (Dockerfile, docs/DOCKER.md) in the GitHub Container
+# Registry, ghcr.io/<owner>/openomsi-server:
+# * every half hour (and by hand) it looks for a new release of openOMSI-Project/openOMSI and,
+#   when that release has no image yet, builds one from its Linux server download for x86-64 and
+#   ARM64: :<version> and :latest. The players' games update to every release by themselves, so
+#   the servers' image follows within the hour - with no change to this repository;
+# * a change to the image's own files (Dockerfile, docker/) builds the latest release again;
+# * a pull request that changes them is built and tried out, not published.
+name: Docker image
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'openOMSI version to build, e.g. 0.1.1541 (empty: the latest release)'
+        required: false
+        default: ''
+      force:
+        description: 'Build and push even if this version already has an image'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [Dockerfile, .dockerignore, 'docker/**', .github/workflows/docker.yml]
+  pull_request:
+    paths: [Dockerfile, .dockerignore, 'docker/**', .github/workflows/docker.yml]
+
+concurrency:
+  group: docker-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: openomsi-server
+  # whose releases the image is made of
+  UPSTREAM: openOMSI-Project/openOMSI
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.find.outputs.version }}
+      latest: ${{ steps.find.outputs.latest }}
+      build: ${{ steps.find.outputs.build }}
+      server_x64: ${{ steps.find.outputs.server_x64 }}
+      server_arm64: ${{ steps.find.outputs.server_arm64 }}
+      client_x64: ${{ steps.find.outputs.client_x64 }}
+      client_arm64: ${{ steps.find.outputs.client_arm64 }}
+    steps:
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # the release to build (the input's, else the newest), the SHA-256 GitHub lists for its
+      # four downloads, and whether to build at all: a scheduled run leaves a version that has
+      # its image alone, and one whose downloads are still being uploaded for the next run
+      - name: Find the release
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          newest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          want=${WANT:-}
+          if [ -n "$want" ]; then tag="v${want#v}"; else tag=$newest; fi
+          v=${tag#v}
+          json=$(gh api "repos/$UPSTREAM/releases/tags/$tag")
+          sum() { printf '%s' "$json" | jq -r --arg n "$1" '.assets[] | select(.name == $n) | (.digest // "none")'; }
+          build=true
+          for pair in server_x64:server-linux-x64 server_arm64:server-linux-arm64 client_x64:linux-x64 client_arm64:linux-arm64; do
+            d=$(sum "openOMSI-$v-${pair#*:}.zip")
+            if [ -z "$d" ]; then
+              echo "::notice::$tag has no openOMSI-$v-${pair#*:}.zip (yet): not built"
+              build=false
+            fi
+            [ "$d" != none ] || d=""
+            echo "${pair%%:*}=$d" >> "$GITHUB_OUTPUT"
+          done
+          image="$REGISTRY/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE"
+          if [ "$build" = true ] && { [ "$EVENT" = schedule ] || { [ "$EVENT" = workflow_dispatch ] && [ "$FORCE" != true ]; }; }; then
+            if docker buildx imagetools inspect "$image:$v" >/dev/null 2>&1; then
+              echo "$image:$v is there already"
+              build=false
+            fi
+          fi
+          {
+            echo "version=$v"
+            echo "latest=$([ "$tag" = "$newest" ] && echo true || echo false)"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+          echo "### openOMSI $v: $([ "$build" = true ] && echo "building $image:$v" || echo "nothing to build")" >> "$GITHUB_STEP_SUMMARY"
+
+  # the image's files changed: lint them, build the image and try it (no OMSI 2 here, so up
+  # to the point where a server needs one)
+  check:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Lint the scripts
+        run: shellcheck docker/entrypoint.sh docker/omsi-health docker/omsi-admin docker/omsi-status
+
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: openomsi-server:check
+          build-args: |
+            BINARY=release
+            OPENOMSI_VERSION=${{ needs.release.outputs.version }}
+            SHA256_SERVER_X64=${{ needs.release.outputs.server_x64 }}
+            SHA256_CLIENT_X64=${{ needs.release.outputs.client_x64 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Try the image
+        run: |
+          set -eu
+          img=openomsi-server:check
+          docker run --rm --entrypoint openomsi "$img" --version
+          [ "$(docker run --rm --entrypoint id "$img" -u)" = 1000 ]
+          # without OMSI 2 it says what to mount and stops
+          if out=$(docker run --rm "$img" 2>&1); then echo "$out"; echo "started without OMSI 2"; exit 1; fi
+          echo "$out" | grep -q 'no OMSI 2 at /omsi2'
+          # the variables reach the server's server.cfg, passwords stay hidden
+          docker run --rm -e OMSI_SERVER_NAME='Check server' -e OMSI_SERVER_ADMIN_PASSWORD=secret "$img" print-config > cfg.txt
+          grep -qx 'name = Check server' cfg.txt
+          grep -qx 'admin_password = \*\*\*\*\*\*\*\*' cfg.txt
+          if grep -q secret cfg.txt; then cat cfg.txt; echo "the password is shown"; exit 1; fi
+          # two ports that cannot both be had are refused before the server starts
+          mkdir -p fake && touch fake/Omsi.exe
+          if out=$(docker run --rm -v "$PWD/fake:/omsi2:ro" -e OMSI_SERVER_WEB_PORT=27015 "$img" 2>&1); then echo "$out"; exit 1; fi
+          echo "$out" | grep -q 'port and web_port are both 27015'
+
+      # (the ARM64 image runs its checks - libraries, --version, the default server.cfg - under
+      # emulation while it is built)
+      - name: Build ARM64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          platforms: linux/arm64
+          build-args: |
+            BINARY=release
+            OPENOMSI_VERSION=${{ needs.release.outputs.version }}
+            SHA256_SERVER_ARM64=${{ needs.release.outputs.server_arm64 }}
+            SHA256_CLIENT_ARM64=${{ needs.release.outputs.client_arm64 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    needs: [release, check]
+    if: >-
+      !cancelled() && github.event_name != 'pull_request' && needs.release.outputs.build == 'true' &&
+      (needs.check.result == 'success' || needs.check.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.release.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.release.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=openOMSI dedicated server
+            org.opencontainers.image.description=The openOMSI dedicated server; mount your own OMSI 2 at /omsi2 (docs/DOCKER.md)
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BINARY=release
+            OPENOMSI_VERSION=${{ needs.release.outputs.version }}
+            SHA256_SERVER_X64=${{ needs.release.outputs.server_x64 }}
+            SHA256_SERVER_ARM64=${{ needs.release.outputs.server_arm64 }}
+            SHA256_CLIENT_X64=${{ needs.release.outputs.client_x64 }}
+            SHA256_CLIENT_ARM64=${{ needs.release.outputs.client_arm64 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
