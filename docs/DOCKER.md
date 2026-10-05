@@ -7,8 +7,8 @@ and ARM64) and for Docker Desktop on Windows and macOS:
 ghcr.io/gtaepic/openomsi-server:latest
 ```
 
-It holds the server of the latest openOMSI release (a new image follows every release within
-the hour) and nothing of the game: **the server needs your own OMSI 2**, mounted read-only,
+It holds the server of the latest openOMSI release (a new image follows every release, usually
+within a few hours) and nothing of the game: **the server needs your own OMSI 2**, mounted read-only,
 exactly as the game does. Everything the server keeps - `server.cfg`, its icon, mods, the
 game's own data - lives in one folder of yours, mounted at `/data`.
 
