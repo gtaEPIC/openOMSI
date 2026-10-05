@@ -1,0 +1,17 @@
+#!/bin/sh
+# Docker's health check of the server (HEALTHCHECK in the Dockerfile). Healthy when
+# * its web port answers /status on the port server.cfg gives (a port the server could not
+#   have, it would swap for a random one Docker does not pass on),
+# * that status has the shared world in it: the server's main loop has started, with the map
+#   loaded (until then the server is "starting", for as long as the start period allows), and
+# * the main loop still turns: it rewrites its status file every 2 s.
+set -eu
+# shellcheck source=/dev/null
+. /tmp/openomsi/runtime.env
+status=$(curl -fsS --max-time 5 "http://127.0.0.1:${OMSI_WEB_PORT}/status")
+case "$status" in
+    *'"world":{'*) ;;
+    *) exit 1 ;;
+esac
+file="${HOME:-/data}/.openomsi/lan/${OMSI_INSTANCE:-server}.json"
+[ -n "$(find "$file" -mmin -1 2>/dev/null)" ]

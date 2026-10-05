@@ -1,0 +1,56 @@
+# An openOMSI dedicated server with Docker Compose (docs/DOCKER.md).
+#
+#   1. Put this file and .env.example (renamed .env) into a folder of their own.
+#   2. In .env, set OMSI2_PATH to your OMSI 2 folder (the one with Omsi.exe, maps and Vehicles).
+#   3. On Linux, give the server its folder first: mkdir data && sudo chown 1000:1000 data
+#   4. docker compose up -d      and watch it start: docker compose logs -f
+#
+# The first start writes data/server.cfg with every setting and what it does: edit it and
+# `docker compose restart`, or set OMSI_SERVER_<KEY> variables below (they win over the file).
+# The players add this machine's address in openOMSI -> Multiplayer -> Servers.
+name: openomsi
+
+services:
+  server:
+    image: ${OPENOMSI_IMAGE:-ghcr.io/gtaepic/openomsi-server:latest}
+    # or build this checkout instead (with the repository's docker/ folder as the working folder):
+    # build:
+    #   context: ..
+    restart: unless-stopped
+    # (it stops within a second or two; this is room for a slow disk)
+    stop_grace_period: 30s
+    ports:
+      - "27015:27015/udp"   # the game, for players who join by address
+      - "27015:27015/tcp"   # the server's mods, for those players
+      - "27025:27025/tcp"   # web: status for the server list, players joining over WebSockets
+    volumes:
+      - type: bind
+        source: ${OMSI2_PATH:?set OMSI2_PATH in .env to your OMSI 2 folder}
+        target: /omsi2
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: true
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      # OMSI_SERVER_NAME: My openOMSI server
+      # OMSI_SERVER_MAP: maps/Grundorf/global.cfg
+      # OMSI_SERVER_MAX_PLAYERS: "16"
+      # no free Cloudflare tunnel: players come straight to this machine's address and ports
+      # OMSI_SERVER_TUNNEL: "0"
+      # the admin password from a file instead of here (Docker secrets, or any file)
+      # OMSI_SERVER_ADMIN_PASSWORD_FILE: /run/secrets/openomsi_admin
+      # the address to put in session codes (this machine's LAN address, see docs/DOCKER.md)
+      # OMSI_LAN_IP: 192.168.1.20
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # the container's own files read-only too (the server only writes to /data and /tmp)
+    # read_only: true
+    # tmpfs: [/tmp]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

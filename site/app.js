@@ -14,6 +14,7 @@ const DOCS = [
   { file: "ROUTES", title: "Routes", icon: "alt_route" },
   { file: "PLUGINS", title: "Plugins", icon: "extension" },
   { file: "SERVER", title: "Dedicated server", icon: "dns" },
+  { file: "DOCKER", title: "Docker server", icon: "inventory_2" },
   { file: "VERSIONING", title: "Versioning & releases", icon: "new_releases" },
 ];
 const PLATFORMS = [
@@ -87,7 +88,8 @@ async function home() {
   if (chip) chip.textContent = rel.tag_name ? `Latest: ${rel.tag_name.replace(/^v/, "")}` : "No release yet";
 }
 
-// How many play openOMSI right now, asked again every minute while the page shows it.
+// How many play openOMSI right now, asked again every five minutes while the page shows it
+// (the counter runs on Cloudflare's free plan: every request counts against its daily limit).
 let playingTimer = null;
 async function playingNow() {
   clearTimeout(playingTimer);
@@ -102,7 +104,7 @@ async function playingNow() {
       chip.hidden = false;
     }
   } catch { /* (the counter is out of reach: the chip stays hidden) */ }
-  playingTimer = setTimeout(playingNow, 60000);
+  playingTimer = setTimeout(playingNow, 300000);
 }
 
 async function download() {

@@ -1,0 +1,27 @@
+# Several openOMSI servers under one web address (compose.multi.yaml). The players add
+#   https://<domain>/spandau   or   https://<domain>/grundorf
+# in openOMSI -> Multiplayer -> Servers. The game asks a server at the address it was given for
+# /status, /icon.png, /ws (the players' WebSockets) and /tcp (the mods); the server answers them
+# at its root, so the path's first part is taken off on the way (handle_path).
+{$OMSI_DOMAIN} {
+	# a server's administration is for its own machine only (the servers refuse it through a
+	# proxy anyway)
+	@admin path */admin
+	route {
+		respond @admin 403
+		handle_path /spandau/* {
+			reverse_proxy spandau:27025
+		}
+		handle_path /grundorf/* {
+			reverse_proxy grundorf:27025
+		}
+		respond "openOMSI servers here: /spandau and /grundorf - add one in openOMSI, Multiplayer, Servers" 200
+	}
+}
+
+# A name of its own for each server instead (each a DNS name pointing here):
+# spandau.example.com {
+# 	@admin path */admin
+# 	respond @admin 403
+# 	reverse_proxy spandau:27025
+# }
