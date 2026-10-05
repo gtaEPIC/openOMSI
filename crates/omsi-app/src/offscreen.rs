@@ -382,6 +382,8 @@ pub(crate) fn run_offscreen(
     let mut spray = puddles::Spray::new();
     let spray_wet = puddles::road_wetness(initial_wetness(&weather), weather.snow);
     let spray_wind = Vec3::new(weather.wind.0.to_radians().sin(), weather.wind.0.to_radians().cos(), 0.0) * weather.wind.1 * puddles::GROUND_WIND;
+    // when the next frame is due, for a session's frames in real time (see below)
+    let mut frame_due = Instant::now();
     for i in 0..total_frames {
         let t_s = i as f32 * dt;
         if server {
@@ -1116,8 +1118,17 @@ pub(crate) fn run_offscreen(
                     s.set_lan_tours(tours);
                 }
             }
-            // the other games run in real time
-            std::thread::sleep(std::time::Duration::from_secs_f32(dt));
+            // the other games run in real time: a frame takes dt in all, the work done in it
+            // counted (a whole dt slept after the work ran a server's world and clock at two
+            // thirds of the players' speed, and their clocks were set back again and again);
+            // a host that fell behind catches up, by at most a second
+            frame_due += std::time::Duration::from_secs_f32(dt);
+            let now = Instant::now();
+            if frame_due > now {
+                std::thread::sleep(frame_due - now);
+            } else if now - frame_due > std::time::Duration::from_secs(1) {
+                frame_due = now;
+            }
         }
         // the tyres' spray, frame by frame as the window throws it (the camera that matters
         // for its detail: the followed car's, else the player's bus)
