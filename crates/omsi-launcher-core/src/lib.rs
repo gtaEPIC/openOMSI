@@ -837,6 +837,28 @@ fn paint_schemes(vehicle: &omsi_vehicle::Vehicle) -> (Vec<String>, Vec<PathBuf>)
     (names, dirs_read)
 }
 
+/// The `[name]`s of the depot files in the top-level `HOFs/` folder of every content root
+/// (shared by all vehicles; a higher-priority root's file hides the same file name lower down).
+fn shared_depot_names() -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for base in bases() {
+        let dir = base.join("HOFs");
+        let mut list = omsi_cfg::vfs::list_dir(&dir).unwrap_or_default();
+        list.sort();
+        for (n, is_dir) in list {
+            let file = n.to_string_lossy().to_ascii_lowercase();
+            if is_dir || !file.ends_with(".hof") || !seen.insert(file) {
+                continue;
+            }
+            if let Some(name) = omsi_vehicle::Hof::read_name(&dir.join(&n)) {
+                names.push(name.trim().to_string());
+            }
+        }
+    }
+    names
+}
+
 /// One line into ~/.openomsi/launcher.log.
 fn log_line(line: &str) {
     use std::io::Write;
@@ -860,6 +882,7 @@ pub fn list_vehicles_progress(progress: impl Fn(&[VehicleInfo], usize, usize)) -
     root()?;
     let lang = content_language();
     let folders = merged_folders("Vehicles");
+    let shared_hofs = shared_depot_names();
     let keys: Vec<String> = folders.iter().map(|(_, dirs)| format!("bus4|{lang}|{}", dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>().join("|"))).collect();
     let read = |(folder, dirs): &(String, Vec<PathBuf>), key: &String| -> Vec<VehicleInfo> {
         // the stamp covers every copy of the folder and their direct entries (Model/,
@@ -886,7 +909,17 @@ pub fn list_vehicles_progress(progress: impl Fn(&[VehicleInfo], usize, usize)) -
             Some(pool) => pool.install(|| chunk.par_iter().zip(chunk_keys.par_iter()).map(|(f, k)| read(f, k)).collect()),
             None => chunk.iter().zip(chunk_keys.iter()).map(|(f, k)| read(f, k)).collect(),
         };
-        let batch: Vec<VehicleInfo> = lists.into_iter().flatten().collect();
+        let mut batch: Vec<VehicleInfo> = lists.into_iter().flatten().collect();
+        // the shared depot files after each bus's own (as the game offers them,
+        // `omsi_vehicle::hof::depot_files`; a bus's own of the same name wins) - after the
+        // cache, whose stamps cover only the vehicle folders
+        for v in batch.iter_mut() {
+            for name in &shared_hofs {
+                if !v.hofs.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                    v.hofs.push(name.clone());
+                }
+            }
+        }
         done += chunk.len();
         // what was read is kept every few seconds: a first reading left half-way (the
         // launcher closed) starts from there the next time
@@ -1709,6 +1742,7 @@ pub const LANGUAGES: &[(&str, &str, &str, &[&str])] = &[
     ("CZE", "Čeština", "cs", &["cs", "cz", "czech", "čeština", "ces"]),
     ("HUN", "Magyar", "hu", &["hu", "hungarian", "magyar"]),
     ("ESP", "Español", "es", &["es", "spa", "spanish", "español"]),
+    ("CAT", "Català", "ca", &["ca", "cat", "ca-es", "ca-ad", "catalan", "català", "catala"]),
     ("PTB", "Português (Brasil)", "pt", &["pt", "br", "pt-br", "por", "portuguese", "português"]),
     ("PTP", "Português (Portugal)", "pt-pt", &["pt-pt", "pt_pt", "pt-portugal", "portuguese-portugal", "português (portugal)", "português de portugal"]),
     ("ITA", "Italiano", "it", &["it", "italian", "italiano"]),
@@ -2391,6 +2425,11 @@ mod save_slot_tests {
 /// The command line a duty becomes.
 pub fn duty_args(d: &Duty) -> Result<Vec<String>> {
     let root = root()?;
+    duty_args_for_root(d, &root)
+}
+
+// The installation is validated by duty_args; argument tests supply their own path.
+fn duty_args_for_root(d: &Duty, root: &Path) -> Result<Vec<String>> {
     if let Some(t) = d.tutorial {
         return Ok(vec!["--root".into(), root.to_string_lossy().to_string(), "--no-menu".into(), "--tutorial".into(), t.to_string()]);
     }
@@ -2791,10 +2830,10 @@ mod tests {
     #[test]
     fn a_picked_trip_starts_the_rest_of_the_tour() {
         let d = Duty { map: "maps/x/global.cfg".into(), bus: "Vehicles/x.bus".into(), time: "09:43".into(), line: Some("14".into()), tour: Some("1".into()), trip: Some("5".into()), whole_tour: true, ..Default::default() };
-        let a = duty_args(&d).unwrap();
+        let a = duty_args_for_root(&d, Path::new("test-omsi")).unwrap();
         let k = a.iter().position(|x| x == "--trip").unwrap();
         assert_eq!((a[k + 1].as_str(), a[k + 2].as_str()), ("5", "--whole-tour"));
-        let alone = duty_args(&Duty { whole_tour: false, ..d }).unwrap();
+        let alone = duty_args_for_root(&Duty { whole_tour: false, ..d }, Path::new("test-omsi")).unwrap();
         assert!(!alone.iter().any(|x| x == "--whole-tour"));
     }
 
@@ -2810,7 +2849,7 @@ mod tests {
     #[test]
     fn a_duty_passes_its_fleet_number() {
         let d: Duty = serde_json::from_str(r#"{"map":"maps/x/global.cfg","bus":"Vehicles/x.bus","time":"09:00","number":"4711"}"#).unwrap();
-        let a = duty_args(&d).unwrap();
+        let a = duty_args_for_root(&d, Path::new("test-omsi")).unwrap();
         assert!(a.windows(2).any(|w| w[0] == "--number" && w[1] == "4711"), "{a:?}");
     }
 
@@ -2820,6 +2859,18 @@ mod tests {
         assert_eq!(language_iso("PTB"), "pt");
         assert_eq!(language_code("pt-PT"), "PTP");
         assert_eq!(language_iso("PTP"), "pt-pt");
+    }
+
+    #[test]
+    fn catalan_survives_settings_round_trip() {
+        for alias in ["CAT", "ca", "ca-ES", "ca-AD", "Català", "catala", "Catalan"] {
+            assert_eq!(language_code(alias), "CAT");
+            assert_eq!(language_iso(alias), "ca");
+            let settings = settings_from_text(Some(&format!("language={alias}\n")));
+            assert_eq!(settings["language"], "CAT");
+            let saved = settings_to_text(&settings, None);
+            assert_eq!(settings_from_text(Some(&saved))["language"], "CAT");
+        }
     }
 
     #[test]

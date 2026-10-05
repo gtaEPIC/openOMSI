@@ -246,7 +246,7 @@ struct GpuPointLight {
     color: [f32; 4],
     /// Spot direction and cosine of the outer cone (-2 = a point light).
     dir: [f32; 4],
-    /// Cosine of the inner cone, the core radius, the beam's gain towards its cut-off, the
+    /// Cosine of the inner cone, the core radius, a headlamp's beam (1 low, -1 full), the
     /// radius (`pos.w` is 0 on a light only the enhanced path draws, which the vanilla
     /// shader then passes by).
     extra: [f32; 4],
@@ -279,11 +279,8 @@ pub struct PointLight {
     /// The radius within which the light is at full strength (`[maplight]`'s); 0 = an
     /// eighth of `radius` (enhanced path; vanilla always takes the eighth).
     pub core: f32,
-    /// A headlight's beam (enhanced path): up to this many times stronger towards the
-    /// horizon than along its axis, so that the road far ahead is lit as a low beam lights
-    /// it rather than only the pool in front of the bumper (0 = an even cone). Negative: a
-    /// full beam, as many times stronger towards the horizon on either side of it (no
-    /// cut-off above).
+    /// A headlamp (enhanced path), lit by a road lamp's profile instead of the cone: 1 a low
+    /// beam, with its cut-off at the lamp's horizon, -1 a full beam, without; 0 any other light.
     pub beam: f32,
     /// Which path draws the light.
     pub mode: LightMode,
@@ -731,6 +728,17 @@ pub type MaterialId = usize;
 pub struct GpuMesh {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
+    /// Where the mesh lies in its page's buffers (pages hold many meshes); `page` is its
+    /// page in the scene's list, `u32::MAX` for a page of its own.
+    page: u32,
+    base_vertex: i32,
+    first_index: u32,
+    vertex_offset: u64,
+    vertex_bytes: u64,
+    index_bytes: u64,
+    /// Which mesh this is (a page's range handed to another mesh is another): what the ray
+    /// tracer's structures are kept by, with the mesh's place.
+    gen: u64,
     pub ranges: Vec<(u32, u32, u32)>,
     pub bounds_center: Vec3,
     pub bounds_radius: f32,
@@ -837,6 +845,8 @@ pub struct Material {
     uniform: MaterialUniform,
     buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Materials that draw alike (same textures, sampler and values) share this number.
+    look: u32,
 }
 
 impl Material {
@@ -1166,10 +1176,19 @@ pub struct Scene {
     /// their entries are rewritten. Rebuilding the whole per-draw buffer for 17 000 objects
     /// because one bus moved was the biggest single CPU cost of a frame.
     changed: Vec<usize>,
+    mesh_pages: Vec<MeshPage>,
     changed_mark: Vec<bool>,
     origin_moved: bool,
     cache_bounds: bool,
     bounds_meshes: Vec<bool>,
+    /// The meshes ever reshaped (skinned), and the instances drawing one of them, so that a
+    /// new pose rescans those instead of the whole scene; stale when an instance's mesh changes.
+    bounds_known: Vec<bool>,
+    bounds_users: Vec<usize>,
+    bounds_users_stale: bool,
+    /// A mesh slot was freed or taken by another mesh: its instances' bounds are redone once
+    /// by a scan of the whole scene, without counting the slot as reshaped.
+    bounds_rescan: bool,
     block_bounds: Vec<(DVec3, DVec3)>,
     block_dirty: Vec<bool>,
     block_cursor: usize,
@@ -1187,6 +1206,8 @@ pub struct Scene {
     /// 965 materials need about a tenth as many). Only for a frame, so that nothing keeps a
     /// freed or replaced texture alive.
     bind_groups: HashMap<BindKey, (wgpu::BindGroup, wgpu::Buffer)>,
+    /// The number of each material look seen so far, by its key's hash (see `Material::look`).
+    looks: hashbrown::HashMap<u64, u32>,
     /// The PBR maps of a diffuse texture (register them before making its materials).
     pub pbr_maps: HashMap<TextureId, PbrMaps>,
     /// Textures that are a season's snow pictures (`WinterSnow` folders): a material drawn
@@ -1202,6 +1223,22 @@ fn snow_texture_flag(scene: &Scene, texture: Option<TextureId>) -> f32 {
         1.0
     } else {
         0.0
+    }
+}
+
+impl Scene {
+    /// The look number of a material bind group made of `key` (numbers start at 1; 0 is the
+    /// shared look of the opaque depth-only draws).
+    fn look(&mut self, key: &BindKey) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        self.intern_look(h.finish())
+    }
+
+    fn intern_look(&mut self, hash: u64) -> u32 {
+        let next = self.looks.len() as u32 + 1;
+        *self.looks.entry(hash).or_insert(next)
     }
 }
 
@@ -1224,22 +1261,24 @@ impl Scene {
             .unwrap_or_default()
     }
 
+    /// Bytes the meshes' pages take on the GPU, each page once, whatever share of it is in use.
+    pub fn mesh_page_bytes(&self) -> u64 {
+        let shared: u64 = self.mesh_pages.iter().map(|p| p.vertex.size() + p.index.size()).sum();
+        // (a set: without base vertices every mesh has buffers of its own, thousands of them)
+        let mut own: std::collections::HashSet<&wgpu::Buffer> = std::collections::HashSet::new();
+        for m in self.meshes.iter().filter(|m| m.page == u32::MAX && !m.ranges.is_empty()) {
+            if own.insert(&m.vertex_buf) {
+                own.insert(&m.index_buf);
+            }
+        }
+        shared + own.iter().map(|b| b.size()).sum::<u64>()
+    }
+
     /// Bytes on the GPU: (textures, mesh buffers, per-draw and light buffers). Freed slots
     /// share one small placeholder, which is not counted.
     pub fn gpu_bytes(&self) -> (u64, u64, u64) {
         let tex = self.textures.iter().map(|t| t.bytes).sum();
-        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        let mut mesh = 0u64;
-        for m in &self.meshes {
-            if m.ranges.is_empty() {
-                continue;
-            }
-            for b in [&m.vertex_buf, &m.index_buf] {
-                if seen.insert(b as *const wgpu::Buffer as *const ()) {
-                    mesh += b.size();
-                }
-            }
-        }
+        let mesh = self.mesh_page_bytes();
         let other = [&self.model_buf, &self.params_buf, &self.light_buf, &self.grid_buf, &self.draw_buf]
             .iter()
             .filter_map(|b| b.as_ref())
@@ -1967,6 +2006,10 @@ pub struct Renderer {
     mip_sampler: wgpu::Sampler,
     /// Set by the device's error handler when something failed with multisampling on.
     gpu_error: Arc<std::sync::atomic::AtomicBool>,
+    /// A GPU error while Enhanced+ traces rays: its ray tracing is left out from the next
+    /// frame on (a frame whose commands the device refused shows nothing at all - left to
+    /// go on, the picture stood still on the loading screen while the game ran behind it).
+    rt_error: Arc<std::sync::atomic::AtomicBool>,
     /// The headset's pictures: the heading (degrees) the `[matl_envmap]` sphere maps are
     /// laid out by instead of each eye's view (see `set_env_heading`).
     env_heading: std::cell::Cell<Option<f32>>,
@@ -2043,6 +2086,8 @@ pub struct Renderer {
     freed: std::cell::OnceCell<Freed>,
     /// Enhanced+: the ray tracer (on a device with ray queries, see `RenderOptions::ray_tracing`).
     rt: Option<rt::RayTracer>,
+    /// Meshes share pages of buffers (the adapter draws with a base vertex).
+    mesh_pages: bool,
 }
 
 /// The placeholders freed scene slots share: an empty vertex and index buffer and a plain
@@ -2423,23 +2468,18 @@ impl Renderer {
             // textures are decoded to RGBA by upload_texture on this device.
             required_features = wgpu::Features::empty();
         }
-        // Enhanced+: hardware ray queries where the device has them and they are known to
-        // work - Metal (Apple silicon from the M3/A17 on). wgpu's ray queries are still
-        // experimental on Vulkan and Direct3D 12: there the game stopped drawing at the end
-        // of the loading screen (sounds and controls going on behind it), so those take
-        // them only with OMSI_RT=1, for testing. OMSI_NO_RT=1 leaves them out everywhere.
-        let rt_backend_ok = info.backend == wgpu::Backend::Metal || omsi_cfg::env::var_os("OMSI_RT").is_some();
+        // Enhanced+: hardware ray queries where the device has them (Apple silicon from the
+        // M3/A17 on, RTX and RDNA 2 cards and newer through Vulkan and Direct3D 12 - with DXC,
+        // which the Windows build ships beside the game); OMSI_NO_RT=1 leaves them out. Should
+        // the device refuse its work all the same, it falls back to Enhanced (`rt_error`).
         let ray_query = options.ray_tracing
             && !intel_vulkan_safe
             && info.backend != wgpu::Backend::Noop
-            && rt_backend_ok
             && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
             && omsi_cfg::env::var_os("OMSI_NO_RT").is_none();
         if ray_query {
             required_features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
             limits = limits.using_acceleration_structure_values(adapter.limits());
-        } else if options.ray_tracing && !rt_backend_ok && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
-            log::warn!("{}: ray tracing on {:?} is not ready yet; Enhanced+ is drawn as Enhanced (OMSI_RT=1 tries it)", info.name, info.backend);
         } else if options.ray_tracing {
             log::warn!("{}: no hardware ray queries; Enhanced+ is drawn as Enhanced", info.name);
         }
@@ -2533,8 +2573,9 @@ impl Renderer {
             format,
             options,
         );
+        let mesh_pages = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::BASE_VERTEX);
         match scope.pop().await {
-            None => Ok(renderer),
+            None => Ok(Renderer { mesh_pages, ..renderer }),
             Some(e) if options.msaa > 1 => {
                 log::error!(
                     "{}x MSAA failed on {}: {}; drawing without multisampling",
@@ -2543,13 +2584,13 @@ impl Renderer {
                     gpu_error_text(&e)
                 );
                 drop(renderer);
-                Ok(Self::build(
+                Ok(Renderer { mesh_pages, ..Self::build(
                     device,
                     queue,
                     format!("{} ({:?})", info.name, info.backend),
                     format,
                     RenderOptions { msaa: 1, ..options },
-                ))
+                ) })
             }
             Some(e) => Err(anyhow!("renderer pipelines: {}", gpu_error_text(&e))),
         }
@@ -2572,6 +2613,7 @@ impl Renderer {
         // drive - a wrong picture for a frame is better than no game. The first errors and
         // then every thousandth reach the log.
         let gpu_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rt_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let out_of_memory = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let device_lost: Arc<std::sync::Mutex<Option<String>>> = Default::default();
         {
@@ -2587,6 +2629,8 @@ impl Renderer {
         }
         {
             let flag = gpu_error.clone();
+            let rt_flag = rt_error.clone();
+            let rt_on = options.ray_tracing;
             let oom = out_of_memory.clone();
             let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
             device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
@@ -2594,7 +2638,12 @@ impl Renderer {
                     oom.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if msaa > 1 && !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if rt_on {
+                    // (the ray tracing goes first: the likelier cause, and the dearer feature)
+                    if !rt_flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::error!("GPU error with ray tracing (Enhanced+ draws as Enhanced from now on): {}", gpu_error_text(&e));
+                    }
+                } else if msaa > 1 && !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::error!("GPU error with {msaa}x MSAA (drawing without it from now on): {}", gpu_error_text(&e));
                 } else if n < 20 || n % 1000 == 0 {
                     log::error!("GPU error #{} (the game goes on): {}", n + 1, gpu_error_text(&e));
@@ -2709,6 +2758,7 @@ impl Renderer {
                     cull: bool,
                     bias: i32,
                     alpha_to_coverage: bool,
+                    terrain_paint: bool,
                     samples: u32| {
             let use_alpha_to_coverage = alpha_to_coverage && samples > 1;
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2754,8 +2804,8 @@ impl Renderer {
                         fs != "fs_surface_depth",
                         fs == "fs_enhanced",
                     ),
-                    // only the alpha-tested pipelines keep their `discard` (see ALPHA_TEST
-                    // in shader.wgsl): early depth testing for everything else
+                    // Only cutouts and painted terrain keep their discard; opaque and
+                    // ordinary blended materials retain early depth testing.
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants: &[
                             ("ALPHA_TEST", if alpha_to_coverage { 1.0 } else { 0.0 }),
@@ -2763,6 +2813,7 @@ impl Renderer {
                                 "ALPHA_TO_COVERAGE",
                                 if use_alpha_to_coverage { 1.0 } else { 0.0 },
                             ),
+                            ("TERRAIN_PAINT", if terrain_paint { 1.0 } else { 0.0 }),
                         ],
                         ..Default::default()
                     },
@@ -2779,9 +2830,9 @@ impl Renderer {
         let scene_pipelines = |f: wgpu::TextureFormat, fs: &str, samples: u32| -> Vec<wgpu::RenderPipeline> {
             let mut out = Vec::with_capacity(PIPE_KINDS as usize * 4);
             for kind in 0..PIPE_KINDS {
-                let blend = (kind == PIPE_BLEND || kind == PIPE_BLEND_NO_WRITE)
+                let blend = matches!(kind, PIPE_BLEND | PIPE_BLEND_NO_WRITE | PIPE_TERRAIN_PAINT)
                     .then_some(wgpu::BlendState::ALPHA_BLENDING);
-                let depth_write = kind != PIPE_BLEND_NO_WRITE;
+                let depth_write = kind != PIPE_BLEND_NO_WRITE && kind != PIPE_TERRAIN_PAINT;
                 for cull in [false, true] {
                     for surface in [false, true] {
                         out.push(make(
@@ -2792,6 +2843,7 @@ impl Renderer {
                             cull,
                             if surface { bias } else { 0 },
                             kind == PIPE_ALPHA_TEST,
+                            kind == PIPE_TERRAIN_PAINT && fs == "fs_enhanced",
                             samples,
                         ));
                     }
@@ -3552,9 +3604,10 @@ impl Renderer {
             make_prepass(2, false),
             make_prepass(2, true),
         ];
-        // (not on Apple's GPUs: their tile renderer drops hidden opaque fragments by itself,
-        // and the extra pass only cost what it saved)
-        let prepass_msaa_pipelines = (msaa > 1 && !cfg!(target_vendor = "apple")).then(|| {
+        // Apple views with cutout/blended draws also need these pipelines: their
+        // visibility depends on shading, unlike opaque hidden-surface removal.
+        // Purely opaque Apple views still skip this pass below to avoid its cost.
+        let prepass_msaa_pipelines = (msaa > 1).then(|| {
             [(0, false), (0, true), (1, false), (1, true), (2, false), (2, true)]
                 .map(|(kind, cull)| make_prepass_samples(kind, cull, msaa))
         });
@@ -4362,6 +4415,7 @@ impl Renderer {
             shadow_blobs: options.shadow_blobs,
             options,
             gpu_error,
+            rt_error,
             env_heading: Default::default(),
             out_of_memory,
             device_lost,
@@ -4382,6 +4436,7 @@ impl Renderer {
             pending_meshes: Default::default(),
             freed: std::cell::OnceCell::new(),
             rt,
+            mesh_pages: false,
         }
     }
 
@@ -4506,10 +4561,15 @@ impl Renderer {
             overlay_res: Vec::new(),
             dirty: true,
             changed: Vec::new(),
+            mesh_pages: Vec::new(),
             changed_mark: Vec::new(),
             origin_moved: false,
             cache_bounds: omsi_cfg::env::var_os("OMSI_NO_BOUNDS_CACHE").is_none(),
             bounds_meshes: Vec::new(),
+            bounds_known: Vec::new(),
+            bounds_users: Vec::new(),
+            bounds_users_stale: true,
+            bounds_rescan: false,
             bounds_dirty: false,
             block_bounds: Vec::new(),
             block_dirty: Vec::new(),
@@ -4521,6 +4581,7 @@ impl Renderer {
             last_grid: Vec::new(),
             last_lights: Vec::new(),
             bind_groups: HashMap::new(),
+            looks: hashbrown::HashMap::new(),
             pbr_maps: HashMap::new(),
             snow_textures: Default::default(),
         }
@@ -4531,6 +4592,7 @@ impl Renderer {
     pub fn set_instance_mesh(&self, scene: &mut Scene, instance: usize, mesh: MeshId) {
         if scene.instances[instance].mesh != mesh {
             scene.instances[instance].mesh = mesh;
+            scene.bounds_users_stale = true;
             Self::mark_changed(scene, instance);
         }
     }
@@ -4556,7 +4618,7 @@ impl Renderer {
             .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&verts);
         let m = &mut scene.meshes[id];
-        if (m.vertex_buf.size() as usize) < bytes.len() {
+        if (m.vertex_bytes as usize) < bytes.len() {
             return;
         }
         {
@@ -4591,16 +4653,35 @@ impl Renderer {
         for (id, b) in &pending {
             let Some(m) = scene.meshes.get(*id) else { continue };
             let len = (b.len() as u64) / 4 * 4;
-            if len == 0 || m.vertex_buf.size() < len {
+            if len == 0 || m.vertex_bytes < len {
                 continue;
             }
-            self.queue.write_buffer(&m.vertex_buf, 0, &b[..len as usize]);
+            self.queue.write_buffer(&m.vertex_buf, m.vertex_offset, &b[..len as usize]);
         }
     }
 
     pub fn add_mesh(&self, scene: &mut Scene, data: &MeshData) -> MeshId {
-        scene.meshes.push(make_mesh(&self.device, &self.queue, data));
+        let (vb, ib) = mesh_page_bytes(data);
+        let mesh = if vb > MESH_PAGE_VERTEX_BYTES / 4 || ib > MESH_PAGE_INDEX_BYTES / 4 || !self.mesh_pages {
+            make_meshes(&self.device, &self.queue, &[data], true).pop().expect("one mesh")
+        } else {
+            let found = scene.mesh_pages.iter_mut().enumerate().find_map(|(k, p)| p.take(vb, ib).map(|at| (k, at)));
+            let (k, at) = found.unwrap_or_else(|| {
+                let mut page = MeshPage::new(&self.device, MESH_PAGE_VERTEX_BYTES, MESH_PAGE_INDEX_BYTES);
+                let at = page.take(vb, ib).expect("a new page holds a mesh a quarter its size");
+                scene.mesh_pages.push(page);
+                (scene.mesh_pages.len() - 1, at)
+            });
+            scene.mesh_pages[k].place(&self.queue, data, k as u32, at)
+        };
+        scene.meshes.push(mesh);
         scene.meshes.len() - 1
+    }
+
+    /// Whether this renderer's adapter draws meshes from shared pages (it can draw with a
+    /// base vertex); [`prepare_meshes`] is told it.
+    pub fn mesh_pages(&self) -> bool {
+        self.mesh_pages
     }
 
     /// Put a mesh made on another thread ([`prepare_mesh`]) into the scene.
@@ -4731,13 +4812,7 @@ impl Renderer {
     /// Bytes the meshes' vertex and index buffers take on the GPU (the freed ones' shared
     /// placeholder not counted).
     pub fn mesh_bytes(&self, scene: &Scene) -> u64 {
-        let freed = self.freed.get().map(|f| (f.vertex_buf.clone(), f.index_buf.clone()));
-        scene
-            .meshes
-            .iter()
-            .filter(|m| freed.as_ref().is_none_or(|(v, _)| m.vertex_buf != *v))
-            .map(|m| m.vertex_buf.size() + m.index_buf.size())
-            .sum()
+        scene.mesh_page_bytes()
     }
 
     pub fn texture_bytes(&self, scene: &Scene) -> u64 {
@@ -5227,6 +5302,7 @@ impl Renderer {
             address,
             uniform: bytemuck::cast(uniform),
         };
+        let look = scene.look(&key);
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
             Some((bg, b)) => (bg.clone(), b.clone()),
             None => {
@@ -5278,6 +5354,7 @@ impl Renderer {
             uniform,
             buf,
             bind_group,
+            look,
         });
         Some(scene.materials.len() - 1)
     }
@@ -5534,6 +5611,7 @@ impl Renderer {
             address,
             uniform: bytemuck::cast(uniform),
         };
+        let look = scene.look(&key);
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
             Some((bg, b)) => (bg.clone(), b.clone()),
             None => {
@@ -5579,6 +5657,7 @@ impl Renderer {
             uniform,
             buf,
             bind_group,
+            look,
         });
         scene.materials.len() - 1
     }
@@ -5949,6 +6028,9 @@ impl Renderer {
             casts_shadow: true,
             roof: None,
         });
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_users.push(scene.instances.len() - 1);
+        }
         scene.instances.len() - 1
     }
 
@@ -6000,6 +6082,9 @@ impl Renderer {
             casts_shadow: false,
             roof: None,
         });
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_users.push(scene.instances.len() - 1);
+        }
         scene.instances.len() - 1
     }
 
@@ -6231,6 +6316,23 @@ impl Renderer {
         scene.bounds_meshes.resize(scene.meshes.len(), false);
         scene.bounds_meshes[mesh] = true;
         scene.bounds_dirty = true;
+        scene.bounds_known.resize(scene.meshes.len(), false);
+        if !scene.bounds_known[mesh] {
+            scene.bounds_known[mesh] = true;
+            scene.bounds_users_stale = true;
+        }
+    }
+
+    /// Slot `mesh` holds another mesh now (freed, or recycled): no longer a reshaped one.
+    fn mesh_slot_replaced(scene: &mut Scene, mesh: MeshId) {
+        scene.bounds_meshes.resize(scene.meshes.len(), false);
+        scene.bounds_meshes[mesh] = true;
+        scene.bounds_dirty = true;
+        scene.bounds_rescan = true;
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_known[mesh] = false;
+            scene.bounds_users_stale = true;
+        }
     }
 
     fn prepare_bounds(scene: &mut Scene) {
@@ -6265,7 +6367,20 @@ impl Renderer {
             if scene.bounds_dirty {
                 // Skinning can alter a shared mesh without changing any model matrix.
                 // Scan once per pose update, rather than once per shadow/mirror view.
-                for (k, i) in scene.instances.iter_mut().enumerate() {
+                if scene.bounds_users_stale {
+                    let known = &scene.bounds_known;
+                    scene.bounds_users = (0..scene.instances.len()).filter(|&k| known.get(scene.instances[k].mesh).copied().unwrap_or(false)).collect();
+                    scene.bounds_users_stale = false;
+                }
+                let all: Vec<usize>;
+                let scan: &[usize] = if std::mem::take(&mut scene.bounds_rescan) {
+                    all = (0..scene.instances.len()).collect();
+                    &all
+                } else {
+                    &scene.bounds_users
+                };
+                for &k in scan {
+                    let Some(i) = scene.instances.get_mut(k) else { continue };
                     if scene.bounds_meshes.get(i.mesh).copied().unwrap_or(false) {
                         i.bounds = InstanceBounds::new(&scene.meshes[i.mesh], i.transform);
                         grow(&mut scene.block_bounds[k / CULL_BLOCK], i);
@@ -7633,6 +7748,21 @@ impl Renderer {
         None
     }
 
+    /// Rebuild without the ray tracing after a GPU error while it was on (see `rt_error`).
+    fn fall_back_without_ray_tracing(&mut self, scene: &mut Scene) {
+        log::error!("ray tracing failed on {}; Enhanced+ draws as Enhanced from now on", self.adapter_name);
+        let options = RenderOptions { ray_tracing: false, ..self.options };
+        RT_BUFFERS.store(false, std::sync::atomic::Ordering::Relaxed);
+        // (the meshes' shared pages stay on, as after the multisampling fallback below)
+        let mesh_pages = self.mesh_pages;
+        *self = Renderer { mesh_pages, ..Self::build(self.device.clone(), self.queue.clone(), self.adapter_name.clone(), self.format, options) };
+        scene.dirty = true;
+        scene.model_buf = None;
+        scene.params_buf = None;
+        scene.camera_bind_group = None;
+        scene.shadow_bind_group = None;
+    }
+
     /// Rebuild the pipelines and targets without multisampling after a GPU error with it.
     /// The scene's materials stay valid (the device hands out the same bind group layout
     /// for identical entries); its per-draw buffers and camera bind group are made anew,
@@ -7643,17 +7773,29 @@ impl Renderer {
             self.options.msaa,
             self.adapter_name
         );
+        // Release render targets before building their single-sample replacements. Keeping
+        // the old targets alive while the new renderer is built can turn a recoverable OOM
+        // into another allocation failure.
+        self.depth = None;
+        self.msaa_targets.clear();
+        self.ao = None;
+        self.hdr_targets.clear();
+        self.scale_targets.clear();
+        self.triple_targets = None;
+        self.glass_picture = None;
+        self.target_use.clear();
         let options = RenderOptions {
             msaa: 1,
             ..self.options
         };
-        *self = Self::build(
+        let mesh_pages = self.mesh_pages;
+        *self = Renderer { mesh_pages, ..Self::build(
             self.device.clone(),
             self.queue.clone(),
             self.adapter_name.clone(),
             self.format,
             options,
-        );
+        ) };
         scene.dirty = true;
         scene.model_buf = None;
         scene.params_buf = None;
@@ -8070,7 +8212,9 @@ impl Renderer {
                 view_formats: &[],
             });
         }
-        if self.gpu_error.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.rt_error.load(std::sync::atomic::Ordering::Relaxed) {
+            self.fall_back_without_ray_tracing(scene);
+        } else if self.gpu_error.load(std::sync::atomic::Ordering::Relaxed) {
             self.fall_back_to_single_sample(scene);
         }
         // OMSI_GPU_TIMERS: GPU time per pass, one frame at a time
@@ -8466,7 +8610,7 @@ impl Renderer {
             .unwrap_or(3.0);
         let casters = |span: std::ops::Range<usize>| -> [Vec<DrawItem>; 3] {
             let mut out: [Vec<DrawItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            let mut ranges: Vec<(u8, u32, u32, usize)> = Vec::new();
+            let mut ranges: Vec<(u8, u32, u32, usize, u32)> = Vec::new();
             for inst in &scene.instances[span] {
                 if !inst.visible || !inst.casts_shadow || (self.options.omsi_shadow_casters && !inst.omsi_caster) {
                     continue;
@@ -8506,7 +8650,7 @@ impl Renderer {
                     if rt_frame && kind == PIPE_OPAQUE {
                         kind = PIPE_KINDS;
                     }
-                    ranges.push((kind, ri as u32, *slot, mat_id));
+                    ranges.push((kind, ri as u32, *slot, mat_id, mat.look));
                 }
                 for (cascade, &(range, lvp, min_radius)) in boxes.iter().enumerate() {
                     if !active[cascade] {
@@ -8530,7 +8674,7 @@ impl Renderer {
                     if dbg {
                         log::info!("shadow: caster r={r:.1} at {:?} slots {:?}", inst.origin, ranges.iter().map(|x| x.0).collect::<Vec<_>>());
                     }
-                    for &(kind, ri, slot, mat_id) in &ranges {
+                    for &(kind, ri, slot, mat_id, look) in &ranges {
                         let kind = if kind == PIPE_KINDS {
                             if cascade != 1 {
                                 continue;
@@ -8539,11 +8683,14 @@ impl Renderer {
                         } else {
                             kind
                         };
+                        // (after the remap: a traced-opaque one is drawn as the opaque it is)
+                        let (material, look) = depth_only_material(kind, mat_id, look);
                         out[cascade].push(DrawItem {
                             pipe: kind,
                             mesh: inst.mesh as u32,
                             range: ri,
-                            material: depth_only_material(kind, mat_id),
+                            material,
+                            look,
                             entry: inst.base + slot,
                         });
                     }
@@ -8917,11 +9064,13 @@ impl Renderer {
                     if let Some(pre_kind) = depth_prepass_kind(kind, mat, inst.presurface) {
                         // plain/alpha-tested materials use their ordinary depth pass;
                         // blended transmaps use the opaque-pixels-only pass.
+                        let (material, look) = depth_only_material(pre_kind, mat_id, mat.look);
                         items.push(DrawItem {
                             pipe: pre_kind * 2 + cull as u8,
                             mesh: inst.mesh as u32,
                             range: ri as u32,
-                            material: depth_only_material(pre_kind, mat_id),
+                            material,
+                            look,
                             entry: inst.base + *slot,
                         });
                     }
@@ -8984,6 +9133,7 @@ impl Renderer {
                                 mesh: inst.mesh as u32,
                                 range: ri as u32,
                                 material: mat_id as u32,
+                                look: mat.look,
                                 entry: inst.base + *slot,
                             });
                         }
@@ -9022,6 +9172,7 @@ impl Renderer {
                             mesh: inst.mesh as u32,
                             range: ri as u32,
                             material: mat_id as u32,
+                            look: mat.look,
                             entry: inst.base + *slot,
                         });
                     }
@@ -9180,6 +9331,19 @@ impl Renderer {
                         } else {
                             PIPE_BLEND
                         };
+                        // Only tile painting gets the zero-coverage fast path. Other
+                        // no-write blends (splines, glass, decals) keep their shader.
+                        let kind = if kind == PIPE_BLEND_NO_WRITE
+                            && mat.alpha == AlphaMode::Blend
+                            && inst.ground_layer
+                            && !inst.presurface
+                            && mat.uniform.extra[0] > 0.5
+                            && mat.transmap.is_some_and(|(_, alpha)| alpha)
+                        {
+                            PIPE_TERRAIN_PAINT
+                        } else {
+                            kind
+                        };
                         let item = DrawItem {
                             pipe: pipe_code(
                                 kind,
@@ -9189,6 +9353,7 @@ impl Renderer {
                             mesh: inst.mesh as u32,
                             range: ri as u32,
                             material: mat_id as u32,
+                            look: mat.look,
                             entry: inst.base + *slot,
                         };
                         // the vehicle the camera is in is drawn after everything else
@@ -9220,12 +9385,18 @@ impl Renderer {
             prepass_batches = pre_batches;
         }
         // OMSI_SKIP_PIPE=3,1: leave pipeline kinds out of the main pass (0 opaque, 1 alpha
-        // tested, 2 blended, 3 blended without depth writes, 4 surface depth) - with
+        // tested, 2 blended, 3 blended without depth writes, 4 surface depth, 5 terrain
+        // paint; 3 includes its specialized terrain variant) - with
         // OMSI_GPU_TIMERS_RAW, what each kind costs the GPU
         if let Ok(skip) = omsi_cfg::env::var("OMSI_SKIP_PIPE") {
             let skip: Vec<u8> = skip.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            main_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
-            cab_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
+            let include = |b: &Batch| {
+                let kind = b.pipe / 4;
+                !skip.contains(&kind)
+                    && !(kind == PIPE_TERRAIN_PAINT && skip.contains(&PIPE_BLEND_NO_WRITE))
+            };
+            main_batches.retain(include);
+            cab_batches.retain(include);
         }
         if debug_draws {
             log::info!("  main pass: {} opaque/alpha-tested and {} blended draws in {} batches; prepass {} batches; draw list {} entries", main_draws[0], main_draws[1], main_batches.len(), prepass_batches.len(), list.len());
@@ -9239,6 +9410,7 @@ impl Renderer {
             let mut c = self.counts.borrow_mut();
             *c.entry("scene instances").or_default() += scene.instances.len() as f64;
             *c.entry("visible instances").or_default() += visible.len() as f64;
+            *c.entry("bounds users").or_default() += scene.bounds_users.len() as f64;
             *c.entry("main draws").or_default() += (main_draws[0] + main_draws[1]) as f64;
             *c.entry("opaque draws").or_default() += main_draws[0] as f64;
             *c.entry("blended draws").or_default() += main_draws[1] as f64;
@@ -9577,11 +9749,22 @@ impl Renderer {
         // the multisampled buffer first. Without it every wall, tree and car hidden behind
         // the one in front ran the whole enhanced shading (11 ms of a 1080p frame in
         // central Spandau with 4x MSAA).
+        // Apple's hidden-surface removal already handles ordinary opaque draws.
+        // Preserve that fast path. In the measured mixed views, prefilling MSAA
+        // depth before cutouts/blends saved more hidden shading than the pass cost.
+        let needs_msaa_prepass = !cfg!(target_vendor = "apple")
+            || main_batches.iter().chain(&cab_batches).any(|batch| {
+                matches!(
+                    batch.pipe / 4,
+                    PIPE_ALPHA_TEST | PIPE_BLEND | PIPE_BLEND_NO_WRITE
+                )
+            });
         let msaa_prepass = enhanced
             && !has_presurface
             && (with_overlays || xr_view)
             && !single
             && prepass_on
+            && needs_msaa_prepass
             && omsi_cfg::env::var_os("OMSI_NO_MSAA_PREPASS").is_none();
         let parts = if !cfg!(any(target_os = "macos", target_os = "ios")) && main_bundles.len() >= 2 && omsi_cfg::env::var_os("OMSI_NO_MAIN_SPLIT").is_none() {
             main_bundles.len().min(2)
@@ -10368,10 +10551,126 @@ fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Option<&str>, 
 /// device with ray queries: their buffers are its geometry input).
 static RT_BUFFERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The GPU buffers of a mesh.
-fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> GpuMesh {
-    let verts: Vec<Vertex> = data
-        .positions
+/// Vertex and index buffers holding several meshes; the space a freed mesh leaves is
+/// handed to the next that fits.
+struct MeshPage {
+    vertex: wgpu::Buffer,
+    index: wgpu::Buffer,
+    vertex_top: u64,
+    index_top: u64,
+    vertex_free: Vec<(u64, u64)>,
+    index_free: Vec<(u64, u64)>,
+}
+
+const MESH_PAGE_VERTEX_BYTES: u64 = 32 << 20;
+const MESH_PAGE_INDEX_BYTES: u64 = 16 << 20;
+
+/// First fit of `len` bytes in `free` (offset, length) or at `top` under `cap`.
+fn page_take(free: &mut Vec<(u64, u64)>, top: &mut u64, cap: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return Some(0);
+    }
+    if let Some(k) = free.iter().position(|&(_, l)| l >= len) {
+        let (o, l) = free[k];
+        if l == len {
+            free.remove(k);
+        } else {
+            free[k] = (o + len, l - len);
+        }
+        return Some(o);
+    }
+    (*top + len <= cap).then(|| {
+        *top += len;
+        *top - len
+    })
+}
+
+/// Give `len` bytes at `at` back, joined to the free space beside them.
+fn page_give(free: &mut Vec<(u64, u64)>, top: &mut u64, at: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let k = free.partition_point(|&(o, _)| o < at);
+    free.insert(k, (at, len));
+    if k + 1 < free.len() && free[k].0 + free[k].1 == free[k + 1].0 {
+        free[k].1 += free[k + 1].1;
+        free.remove(k + 1);
+    }
+    if k > 0 && free[k - 1].0 + free[k - 1].1 == free[k].0 {
+        free[k - 1].1 += free[k].1;
+        free.remove(k);
+    }
+    if let Some(&(o, l)) = free.last() {
+        if o + l == *top {
+            *top = o;
+            free.pop();
+        }
+    }
+}
+
+impl MeshPage {
+    fn new(device: &wgpu::Device, vertex_bytes: u64, index_bytes: u64) -> MeshPage {
+        let blas = if RT_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() };
+        let buffer = |size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some("mesh page"), size: size.max(32), usage: usage | wgpu::BufferUsages::COPY_DST | blas, mapped_at_creation: false });
+        MeshPage {
+            vertex: buffer(vertex_bytes, wgpu::BufferUsages::VERTEX),
+            index: buffer(index_bytes, wgpu::BufferUsages::INDEX),
+            vertex_top: 0,
+            index_top: 0,
+            vertex_free: Vec::new(),
+            index_free: Vec::new(),
+        }
+    }
+
+    /// Room for a mesh of these sizes: its vertex and index offsets.
+    fn take(&mut self, vertex_bytes: u64, index_bytes: u64) -> Option<(u64, u64)> {
+        let v = page_take(&mut self.vertex_free, &mut self.vertex_top, self.vertex.size(), vertex_bytes)?;
+        match page_take(&mut self.index_free, &mut self.index_top, self.index.size(), index_bytes) {
+            Some(i) => Some((v, i)),
+            None => {
+                page_give(&mut self.vertex_free, &mut self.vertex_top, v, vertex_bytes);
+                None
+            }
+        }
+    }
+
+    fn give(&mut self, m: &GpuMesh) {
+        page_give(&mut self.vertex_free, &mut self.vertex_top, m.vertex_offset, m.vertex_bytes);
+        page_give(&mut self.index_free, &mut self.index_top, m.first_index as u64 * 4, m.index_bytes);
+    }
+
+    /// Write the mesh at these offsets.
+    fn place(&self, queue: &wgpu::Queue, data: &MeshData, page: u32, at: (u64, u64)) -> GpuMesh {
+        let verts = mesh_vertices(data);
+        let (vb, ib): (&[u8], &[u8]) = (bytemuck::cast_slice(&verts), bytemuck::cast_slice(&data.indices));
+        if !vb.is_empty() {
+            queue.write_buffer(&self.vertex, at.0, vb);
+        }
+        if !ib.is_empty() {
+            queue.write_buffer(&self.index, at.1, ib);
+        }
+        let (center, radius) = mesh_bounds(data);
+        GpuMesh {
+            vertex_buf: self.vertex.clone(),
+            index_buf: self.index.clone(),
+            page,
+            base_vertex: (at.0 / std::mem::size_of::<Vertex>() as u64) as i32,
+            first_index: (at.1 / 4) as u32,
+            vertex_offset: at.0,
+            vertex_bytes: vb.len() as u64,
+            index_bytes: ib.len() as u64,
+            gen: next_gen(),
+            ranges: data.ranges.clone(),
+            bounds_center: center,
+            bounds_radius: radius,
+            one_sided: data.one_sided,
+            source: None,
+        }
+    }
+}
+
+fn mesh_vertices(data: &MeshData) -> Vec<Vertex> {
+    data.positions
         .iter()
         .zip(&data.normals)
         .zip(&data.uvs)
@@ -10380,10 +10679,15 @@ fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> Gpu
             normal: n.to_array(),
             uv: uv.to_array(),
         })
-        .collect();
-    let blas = if RT_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() };
-    let vertex_buf = buffer_init(device, queue, None, bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | blas);
-    let index_buf = buffer_init(device, queue, None, bytemuck::cast_slice(&data.indices), wgpu::BufferUsages::INDEX | blas);
+        .collect()
+}
+
+fn mesh_page_bytes(data: &MeshData) -> (u64, u64) {
+    let v = data.positions.len().min(data.normals.len()).min(data.uvs.len());
+    ((v * std::mem::size_of::<Vertex>()) as u64, (data.indices.len() * 4) as u64)
+}
+
+fn mesh_bounds(data: &MeshData) -> (Vec3, f32) {
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for p in &data.positions {
         lo = lo.min(*p);
@@ -10394,15 +10698,26 @@ fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> Gpu
         hi = Vec3::ZERO;
     }
     let center = (lo + hi) * 0.5;
-    GpuMesh {
-        vertex_buf,
-        index_buf,
-        ranges: data.ranges.clone(),
-        bounds_center: center,
-        bounds_radius: (hi - center).length(),
-        one_sided: data.one_sided,
-        source: None,
+    (center, (hi - center).length())
+}
+
+/// The meshes in one page of their own, sized to them (each in a page of its own where the
+/// adapter cannot draw with a base vertex: `paged` false).
+fn make_meshes(device: &wgpu::Device, queue: &wgpu::Queue, data: &[&MeshData], paged: bool) -> Vec<GpuMesh> {
+    if data.is_empty() {
+        return Vec::new();
     }
+    if !paged {
+        return data.iter().map(|d| make_meshes(device, queue, &[d], true).pop().expect("one mesh")).collect();
+    }
+    let sizes: Vec<(u64, u64)> = data.iter().map(|d| mesh_page_bytes(d)).collect();
+    let page = MeshPage::new(device, sizes.iter().map(|s| s.0).sum(), sizes.iter().map(|s| s.1).sum());
+    let mut at = (0, 0);
+    data.iter().zip(&sizes).map(|(d, s)| {
+        let m = page.place(queue, d, u32::MAX, at);
+        at = (at.0 + s.0, at.1 + s.1);
+        m
+    }).collect()
 }
 
 /// A mesh on the GPU, made on a worker thread; [`Renderer::add_prepared_mesh`] puts it into
@@ -10411,8 +10726,14 @@ pub struct PreparedMesh(GpuMesh);
 
 /// Make a mesh's GPU buffers on any thread (the device takes calls from all of them).
 pub fn prepare_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> PreparedMesh {
+    prepare_meshes(device, queue, &[data], false).pop().expect("one mesh")
+}
+
+/// [`prepare_mesh`] for several meshes at once, which share one page of buffers.
+/// `paged`: [`Renderer::mesh_pages`] of the renderer the meshes are for.
+pub fn prepare_meshes(device: &wgpu::Device, queue: &wgpu::Queue, data: &[&MeshData], paged: bool) -> Vec<PreparedMesh> {
     let _turn = gl_worker_turn();
-    PreparedMesh(make_mesh(device, queue, data))
+    make_meshes(device, queue, data, paged).into_iter().map(PreparedMesh).collect()
 }
 
 /// A texture on the GPU, made on a worker thread; [`Renderer::add_prepared_texture`] puts it
@@ -11382,10 +11703,12 @@ struct DrawItem {
     mesh: u32,
     range: u32,
     material: u32,
+    /// The material's look: draws of materials that look alike are batched together.
+    look: u32,
     entry: u32,
 }
 
-/// Draws of the same mesh range with the same material and pipeline, made as one instanced
+/// Draws of the same mesh range with materials that look alike and the same pipeline, made as one instanced
 /// draw: `instances` indexes the frame's draw list, which holds each instance's per-draw
 /// entry (the vertex shader looks it up). Thousands of single draws were the biggest CPU
 /// cost of a frame - wgpu validates and records every one - and trees, lamps, fences,
@@ -11401,7 +11724,7 @@ struct Batch {
 }
 
 /// Turn draw items into batches, appending their entries to `list`. `sort`: the order does
-/// not matter (depth-tested opaque and alpha-tested draws), so equal draws are gathered;
+/// not matter (depth-tested opaque and alpha-tested draws), so draws alike are gathered;
 /// otherwise only neighbours are merged (the blended pass keeps its far-to-near order).
 fn batch_items(
     scene: &Scene,
@@ -11410,23 +11733,11 @@ fn batch_items(
     list: &mut Vec<u32>,
     out: &mut Vec<Batch>,
 ) {
-    if sort {
-        items.sort_unstable_by_key(|d| (d.pipe, d.material, d.mesh, d.range));
-    }
-    let mut k = 0;
-    while k < items.len() {
-        let d = items[k];
-        let start = list.len() as u32;
-        while k < items.len()
-            && (
-                items[k].pipe,
-                items[k].mesh,
-                items[k].range,
-                items[k].material,
-            ) == (d.pipe, d.mesh, d.range, d.material)
-        {
-            list.push(items[k].entry);
-            k += 1;
+    // a batch keeps the material of the one before it when they look alike: no rebinding
+    let mut last = (u32::MAX, 0);
+    let mut push = |d: &DrawItem, start: u32, list: &Vec<u32>| {
+        if last.0 != d.look {
+            last = (d.look, d.material);
         }
         let (first, count, _) = scene.meshes[d.mesh as usize].ranges[d.range as usize];
         out.push(Batch {
@@ -11434,20 +11745,75 @@ fn batch_items(
             mesh: d.mesh,
             first,
             count,
-            material: d.material,
+            material: last.1,
             instances: start..list.len() as u32,
         });
+    };
+    if sort {
+        let bits = |n: u32| u32::BITS - n.leading_zeros();
+        let (mut look, mut mesh, mut range) = (0, 0, 0);
+        for d in items.iter() {
+            (look, mesh, range) = (look | d.look, mesh | d.mesh, range | d.range);
+        }
+        let mesh_shift = bits(range);
+        let look_shift = mesh_shift + bits(mesh);
+        let pipe_shift = look_shift + bits(look);
+        if pipe_shift + 8 <= 64 {
+            // one number a draw sorts twice as fast as comparing the four fields
+            let mut keys: Vec<(u64, u32, u32)> = items
+                .iter()
+                .map(|d| {
+                    let key = (d.pipe as u64) << pipe_shift
+                        | (d.look as u64) << look_shift
+                        | (d.mesh as u64) << mesh_shift
+                        | d.range as u64;
+                    (key, d.entry, d.material)
+                })
+                .collect();
+            keys.sort_unstable_by_key(|k| k.0);
+            let field = |key: u64, from: u32, to: u32| ((key >> from) & ((1 << (to - from)) - 1)) as u32;
+            let mut k = 0;
+            while k < keys.len() {
+                let (key, _, material) = keys[k];
+                let start = list.len() as u32;
+                while k < keys.len() && keys[k].0 == key {
+                    list.push(keys[k].1);
+                    k += 1;
+                }
+                let d = DrawItem {
+                    pipe: (key >> pipe_shift) as u8,
+                    mesh: field(key, mesh_shift, look_shift),
+                    range: field(key, 0, mesh_shift),
+                    material,
+                    look: field(key, look_shift, pipe_shift),
+                    entry: 0,
+                };
+                push(&d, start, list);
+            }
+            return;
+        }
+        items.sort_unstable_by_key(|d| (d.pipe, d.look, d.mesh, d.range));
+    }
+    let mut k = 0;
+    while k < items.len() {
+        let d = items[k];
+        let start = list.len() as u32;
+        while k < items.len() && (items[k].pipe, items[k].mesh, items[k].range, items[k].look) == (d.pipe, d.mesh, d.range, d.look) {
+            list.push(items[k].entry);
+            k += 1;
+        }
+        push(&d, start, list);
     }
 }
 
-/// The material a depth-only draw (shadow map, depth prepass) is batched with: an opaque
-/// surface writes its depth whatever its texture, so all of them share the first material
-/// and batch across materials; an alpha-tested one needs its own texture for the cut-out.
-fn depth_only_material(kind: u8, material: MaterialId) -> u32 {
+/// The material and look a depth-only draw (shadow map, depth prepass) is batched with: an
+/// opaque surface writes its depth whatever its texture, so all of them share the first
+/// material and batch across materials; an alpha-tested one needs its own texture for the cut-out.
+fn depth_only_material(kind: u8, material: MaterialId, look: u32) -> (u32, u32) {
     if kind == 0 {
-        0
+        (0, 0)
     } else {
-        material as u32
+        (material as u32, look)
     }
 }
 
@@ -11472,6 +11838,8 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
     pipeline: impl Fn(u8) -> &'a wgpu::RenderPipeline,
 ) {
     let (mut pipe, mut mesh, mut material) = (u8::MAX, u32::MAX, u32::MAX);
+    let mut page: Option<(&wgpu::Buffer, &wgpu::Buffer)> = None;
+    let (mut base_vertex, mut first_index) = (0i32, 0u32);
     for b in batches {
         if !include(b) {
             continue;
@@ -11482,8 +11850,12 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
         }
         if b.mesh != mesh {
             let m = &scene.meshes[b.mesh as usize];
-            pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
-            pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            if page.is_none_or(|(v, i)| *v != m.vertex_buf || *i != m.index_buf) {
+                pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
+                pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                page = Some((&m.vertex_buf, &m.index_buf));
+            }
+            (base_vertex, first_index) = (m.base_vertex, m.first_index);
             mesh = b.mesh;
         }
         if b.material != material {
@@ -11494,18 +11866,19 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
             );
             material = b.material;
         }
-        pass.draw_indexed(b.first..b.first + b.count, 0, b.instances.clone());
+        pass.draw_indexed(first_index + b.first..first_index + b.first + b.count, base_vertex, b.instances.clone());
     }
 }
 
 /// Main pass pipeline kinds (`pipe_code`): opaque, alpha-tested, blended, blended
-/// without depth write, and the depth-only coverage of composed ground surfaces.
+/// without depth write, depth-only surface coverage, and painted terrain without depth write.
 const PIPE_OPAQUE: u8 = 0;
 const PIPE_ALPHA_TEST: u8 = 1;
 const PIPE_BLEND: u8 = 2;
 const PIPE_BLEND_NO_WRITE: u8 = 3;
 const PIPE_SURFACE_DEPTH: u8 = 4;
-const PIPE_KINDS: u8 = 5;
+const PIPE_TERRAIN_PAINT: u8 = 5;
+const PIPE_KINDS: u8 = 6;
 
 fn effective_render_phase(instance: &Instance) -> RenderPhase {
     if instance.presurface {
@@ -11955,13 +12328,22 @@ impl Renderer {
             let f = self.freed(scene);
             (f.vertex_buf.clone(), f.index_buf.clone())
         };
+        if let Some(page) = scene.mesh_pages.get_mut(scene.meshes[id].page as usize) {
+            page.give(&scene.meshes[id]);
+        }
         let m = &mut scene.meshes[id];
         m.vertex_buf = vertex_buf;
         m.index_buf = index_buf;
+        m.page = u32::MAX;
+        m.base_vertex = 0;
+        m.first_index = 0;
+        m.vertex_offset = 0;
+        m.vertex_bytes = 0;
+        m.index_bytes = 0;
         m.ranges.clear();
         m.bounds_center = Vec3::ZERO;
         m.bounds_radius = 0.0;
-        Self::mesh_bounds_changed(scene, id);
+        Self::mesh_slot_replaced(scene, id);
     }
 
     /// Release a texture (a material still using it keeps it alive until it is freed too).
@@ -11993,6 +12375,7 @@ impl Renderer {
             let f = self.freed(scene);
             (f.bind_group.clone(), f.buf.clone())
         };
+        let look = scene.intern_look(0);
         scene.materials[id] = Material {
             texture: None,
             alpha: AlphaMode::Opaque,
@@ -12013,6 +12396,7 @@ impl Renderer {
             uniform: <MaterialUniform as bytemuck::Zeroable>::zeroed(),
             buf,
             bind_group,
+            look,
         };
     }
 
@@ -12045,11 +12429,13 @@ impl Renderer {
             }
         }
         cut(&mut scene.meshes, meshes);
+        scene.bounds_known.truncate(meshes);
         cut(&mut scene.textures, textures);
         cut(&mut scene.materials, materials);
         // hidden (freed) instances may still name a cut mesh or material: slot 0 instead,
         // they are not drawn and whoever takes them over sets their own
         let (nm, nt) = (scene.meshes.len(), scene.materials.len());
+        scene.bounds_users_stale = true;
         for inst in scene.instances.iter_mut() {
             if inst.mesh >= nm {
                 debug_assert!(!inst.visible, "a drawn instance lost its mesh");
@@ -12077,7 +12463,7 @@ impl Renderer {
         }
         let m = scene.meshes.pop().unwrap();
         scene.meshes[into] = m;
-        Self::mesh_bounds_changed(scene, into);
+        Self::mesh_slot_replaced(scene, into);
         into
     }
 
@@ -12117,6 +12503,7 @@ impl Renderer {
         let mut inst = scene.instances.pop().unwrap();
         inst.base = scene.instances[into].base;
         scene.instances[into] = inst;
+        scene.bounds_users_stale = true;
         Self::mark_changed(scene, into);
         into
     }
@@ -12382,6 +12769,545 @@ mod tests {
             b[0] > b[1] + 30 && b[0] > b[2] + 30,
             "foliage cutout must reveal red: {b:?}"
         );
+    }
+
+    #[test]
+    fn a_mesh_page_hands_freed_space_to_the_next_mesh_and_joins_its_holes() {
+        let (mut free, mut top) = (Vec::new(), 0u64);
+        let a = page_take(&mut free, &mut top, 1000, 100).unwrap();
+        let b = page_take(&mut free, &mut top, 1000, 200).unwrap();
+        let c = page_take(&mut free, &mut top, 1000, 300).unwrap();
+        assert_eq!((a, b, c, top), (0, 100, 300, 600));
+        page_give(&mut free, &mut top, b, 200);
+        assert_eq!(free, vec![(100, 200)]);
+        assert_eq!(page_take(&mut free, &mut top, 1000, 150), Some(100));
+        assert_eq!(free, vec![(250, 50)]);
+        page_give(&mut free, &mut top, a, 100);
+        page_give(&mut free, &mut top, 100, 150);
+        assert_eq!(free, vec![(0, 300)]);
+        page_give(&mut free, &mut top, c, 300);
+        assert_eq!((free.len(), top), (0, 0));
+        assert_eq!(page_take(&mut free, &mut top, 1000, 1001), None);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn meshes_coming_and_going_tile_by_tile_keep_the_pages_from_growing() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        if !renderer.mesh_pages() {
+            return;
+        }
+        let mut scene = renderer.new_scene();
+        let mesh = |n: usize| {
+            let positions: Vec<Vec3> = (0..n).map(|i| Vec3::new(i as f32, (i % 7) as f32, 0.0)).collect();
+            let indices: Vec<u32> = (0..n as u32 / 3 * 3).collect();
+            MeshData { normals: vec![Vec3::Z; n], uvs: vec![glam::Vec2::ZERO; n], ranges: vec![(0, indices.len() as u32, 0)], positions, indices, ..Default::default() }
+        };
+        // tiles of a few thousand meshes of every size, loaded and unloaded in no order, as
+        // a long drive across a map brings them; the scene's pages must not keep growing
+        let mut tiles: Vec<Vec<MeshId>> = Vec::new();
+        let mut seed = 0x1234_5678u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut most = 0;
+        for round in 0..300 {
+            let tile: Vec<MeshId> = (0..400).map(|_| renderer.add_mesh(&mut scene, &mesh(3 + (rand() % 600) as usize))).collect();
+            tiles.push(tile);
+            if tiles.len() > 12 {
+                let gone = tiles.remove((rand() % tiles.len() as u64) as usize);
+                for id in gone {
+                    renderer.free_mesh(&mut scene, id);
+                }
+            }
+            if round == 50 {
+                most = scene.mesh_pages.len();
+            }
+        }
+        assert!(scene.mesh_pages.len() <= most + 1, "the pages grew from {most} to {} over the drive", scene.mesh_pages.len());
+        let held = scene.mesh_page_bytes();
+        let used: u64 = scene.meshes.iter().filter(|m| m.page != u32::MAX).map(|m| m.vertex_bytes + m.index_bytes).sum();
+        assert!(held < used * 3, "{held} bytes of pages held for {used} in use");
+        for t in &tiles {
+            for &id in t {
+                let m = &scene.meshes[id];
+                assert_eq!(m.vertex_offset % std::mem::size_of::<Vertex>() as u64, 0);
+                assert!(m.vertex_offset + m.vertex_bytes <= m.vertex_buf.size());
+                assert!(m.first_index as u64 * 4 + m.index_bytes <= m.index_buf.size());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn msaa_depth_prepass_preserves_layered_surfaces() {
+        fn quad(renderer: &Renderer, scene: &mut Scene, z: f32, mat: MaterialId) -> usize {
+            let mesh = renderer.add_mesh(
+                scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(-4.0, -4.0, z),
+                        Vec3::new(4.0, -4.0, z),
+                        Vec3::new(4.0, 4.0, z),
+                        Vec3::new(-4.0, 4.0, z),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![
+                        glam::Vec2::ZERO,
+                        glam::Vec2::X,
+                        glam::Vec2::ONE,
+                        glam::Vec2::Y,
+                    ],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_surface_instance(scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![mat])
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = pollster::block_on(Renderer::new_with(
+            &instance,
+            None,
+            Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions {
+                msaa: 4,
+                ssao: true,
+                fxaa: false,
+                render_scale: 1.0,
+                ..Default::default()
+            },
+        ))
+        .expect("test renderer");
+        if renderer.options.msaa <= 1 {
+            return; // This adapter cannot exercise a multisampled depth buffer.
+        }
+        assert!(renderer.prepass_msaa_pipelines.is_some());
+        let mut scene = renderer.new_scene();
+        let mask = renderer.add_texture(
+            &mut scene,
+            &omsi_texture::Image {
+                width: 7,
+                height: 1,
+                rgba: [0, 0, 112, 128, 160, 255, 255]
+                    .into_iter()
+                    .flat_map(|a| [255, 255, 255, a])
+                    .collect(),
+                has_alpha: true,
+            },
+            false,
+        );
+        let base = renderer.add_terrain_material(&mut scene, None, None, None, 1.0, None, 1.0);
+        let ground = quad(&renderer, &mut scene, 0.0, base);
+        scene.instances[ground].render_phase = RenderPhase::Terrain;
+        let paint =
+            renderer.add_terrain_layer_material(&mut scene, None, mask, None, 1.0, None, 1.0);
+        let layer = quad(&renderer, &mut scene, 0.0, paint);
+        scene.instances[layer].ground_layer = true;
+        scene.instances[layer].render_phase = RenderPhase::Terrain;
+        let road_mat = renderer.add_material(
+            &mut scene,
+            None,
+            AlphaMode::Opaque,
+            [0.0, 0.0, 1.0, 1.0],
+            true,
+        );
+        let road = quad(&renderer, &mut scene, 0.02, road_mat);
+        scene.instances[road].render_phase = RenderPhase::Spline;
+        let cutout = renderer.add_material(
+            &mut scene,
+            Some(mask),
+            AlphaMode::Test,
+            [0.0, 1.0, 0.0, 1.0],
+            false,
+        );
+        let fence = quad(&renderer, &mut scene, 0.3, cutout);
+        scene.instances[fence].render_phase = RenderPhase::Normal;
+        let blend = renderer.add_material(
+            &mut scene,
+            None,
+            AlphaMode::Blend,
+            [1.0, 0.0, 0.0, 0.25],
+            false,
+        );
+        let pane = quad(&renderer, &mut scene, 0.5, blend);
+        scene.instances[pane].render_phase = RenderPhase::Normal;
+        let camera = Camera {
+            position: DVec3::new(0.0, -0.105, 6.0),
+            yaw: 0.0,
+            pitch: -89.0,
+            roll: 0.0,
+            fov_deg: 90.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        for wetness in [0.0, 1.0] {
+            let lighting = Lighting {
+                enhanced: true,
+                shadows: false,
+                fog_density: 0.0,
+                wetness,
+                ..Default::default()
+            };
+            let enabled = renderer
+                .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                .unwrap();
+            let pipelines = renderer.prepass_msaa_pipelines.take().unwrap();
+            let disabled = renderer
+                .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                .unwrap();
+            renderer.prepass_msaa_pipelines = Some(pipelines);
+            let delta = enabled
+                .iter()
+                .zip(&disabled)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                delta <= 2,
+                "MSAA prepass changed layered surfaces by {delta}: wetness {wetness}"
+            );
+            let pixel = |x: usize| &enabled[(32 * 64 + x) * 4..(32 * 64 + x) * 4 + 3];
+            assert!(
+                pixel(12)[2] > pixel(12)[1] + 30,
+                "cutout hid the road: {:?}",
+                pixel(12)
+            );
+            assert!(
+                pixel(52)[1] > pixel(52)[2] + 30,
+                "opaque cutout disappeared: {:?}",
+                pixel(52)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn a_reshaped_mesh_moves_the_bounds_of_every_instance_drawing_it() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        scene.cache_bounds = true;
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Opaque, [1.0; 4], true);
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let (skinned, plain) = (renderer.add_mesh(&mut scene, &data), renderer.add_mesh(&mut scene, &data));
+        let mut add = |scene: &mut Scene, mesh, x: f64| renderer.add_instance(scene, mesh, DVec3::new(x, 0.0, 0.0), Mat4::IDENTITY, vec![material]);
+        let first = add(&mut scene, skinned, 0.0);
+        let others: Vec<usize> = (0..300).map(|k| add(&mut scene, plain, k as f64 * 10.0)).collect();
+        renderer.prepare(&mut scene);
+        let pose = |scale: f32| -> Vec<Vec3> { data.positions.iter().map(|p| *p * scale).collect() };
+        renderer.update_mesh(&mut scene, skinned, &pose(5.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        // one added after the first pose, one switched to the skinned mesh
+        let late = add(&mut scene, skinned, 50.0);
+        renderer.set_instance_mesh(&mut scene, others[7], skinned);
+        renderer.prepare(&mut scene);
+        renderer.update_mesh(&mut scene, skinned, &pose(9.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        let expected = InstanceBounds::new(&scene.meshes[skinned], Mat4::IDENTITY);
+        for i in [first, late, others[7]] {
+            assert_eq!(scene.instances[i].bounds.radius, expected.radius, "instance {i}");
+        }
+        assert_ne!(scene.instances[others[8]].bounds.radius, expected.radius);
+        assert!(scene.bounds_users.len() <= 4, "{} instances rescanned", scene.bounds_users.len());
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn terrain_paint_fast_path_preserves_composition() {
+        fn quad(
+            renderer: &Renderer,
+            scene: &mut Scene,
+            rect: [f32; 4],
+            z: f32,
+            mat: MaterialId,
+        ) -> usize {
+            let [left, right, bottom, top] = rect;
+            let mesh = renderer.add_mesh(
+                scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(left, bottom, z),
+                        Vec3::new(right, bottom, z),
+                        Vec3::new(right, top, z),
+                        Vec3::new(left, top, z),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![
+                        glam::Vec2::ZERO,
+                        glam::Vec2::X,
+                        glam::Vec2::ONE,
+                        glam::Vec2::Y,
+                    ],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_surface_instance(scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![mat])
+        }
+        for msaa in [1, 4] {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let mut renderer = pollster::block_on(Renderer::new_with(
+                &instance,
+                None,
+                Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                RenderOptions {
+                    msaa,
+                    ssao: false,
+                    shadow_size: 1024,
+                    fxaa: false,
+                    render_scale: 1.0,
+                    ..Default::default()
+                },
+            ))
+            .expect("test renderer");
+            let mut scene = renderer.new_scene();
+            let base = renderer.add_terrain_material(&mut scene, None, None, None, 1.0, None, 1.0);
+            let ground = quad(&renderer, &mut scene, [-6.0, 6.0, -6.0, 6.0], 0.0, base);
+            scene.instances[ground].render_phase = RenderPhase::Terrain;
+            let mut paint_materials = Vec::new();
+            for (rgb, alphas) in [
+                ([160, 40, 40], [0, 0, 112, 128, 160, 255, 255]),
+                ([40, 160, 40], [255, 255, 160, 128, 112, 0, 0]),
+            ] {
+                let diffuse = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 4,
+                        height: 4,
+                        rgba: (0..16)
+                            .flat_map(|i| {
+                                let c = rgb.map(|v| {
+                                    if (i / 4 + i % 4) % 2 == 0 { v } else { v / 2 }
+                                });
+                                [c[0], c[1], c[2], 255]
+                            })
+                            .collect(),
+                        has_alpha: false,
+                    },
+                    false,
+                );
+                let mask = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 7,
+                        height: 1,
+                        rgba: alphas
+                            .into_iter()
+                            .flat_map(|a| [255, 255, 255, a])
+                            .collect(),
+                        has_alpha: true,
+                    },
+                    false,
+                );
+                // Generated tiled detail exercises sampling beside empty mask pixels.
+                let detail = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 4,
+                        height: 4,
+                        rgba: (0..16)
+                            .flat_map(|i| {
+                                let v = if (i / 4 + i % 4) % 2 == 0 { 160 } else { 255 };
+                                [v, v, v, 255]
+                            })
+                            .collect(),
+                        has_alpha: false,
+                    },
+                    false,
+                );
+                let mat = renderer.add_terrain_layer_material(
+                    &mut scene,
+                    Some(diffuse),
+                    mask,
+                    Some((detail, 12.0)),
+                    8.0,
+                    None,
+                    1.0,
+                );
+                paint_materials.push(mat);
+                let layer = quad(&renderer, &mut scene, [-6.0, 6.0, -6.0, 6.0], 0.0, mat);
+                scene.instances[layer].ground_layer = true;
+                scene.instances[layer].render_phase = RenderPhase::Terrain;
+            }
+            let blue = renderer.add_material(
+                &mut scene,
+                None,
+                AlphaMode::Opaque,
+                [0.0, 0.0, 1.0, 1.0],
+                true,
+            );
+            let road = quad(&renderer, &mut scene, [-6.0, 6.0, -0.7, 0.7], 0.02, blue);
+            scene.instances[road].render_phase = RenderPhase::Spline;
+            let camera = Camera {
+                position: DVec3::new(0.0, -0.105, 6.0),
+                yaw: 0.0,
+                pitch: -89.0,
+                roll: 0.0,
+                fov_deg: 90.0,
+                near: 0.1,
+                far: 100.0,
+            };
+            // Compare identical scene data through the specialized and original no-write
+            // pipelines, including water's opacity and wet-ground reflection coverage.
+            for (wetness, water) in [(0.0, false), (1.0, false), (1.0, true)] {
+                if water {
+                    for &mat in &paint_materials {
+                        scene.materials[mat].uniform.ambient[3] = 2.0;
+                        renderer.queue.write_buffer(
+                            &scene.materials[mat].buf,
+                            0,
+                            bytemuck::bytes_of(&scene.materials[mat].uniform),
+                        );
+                    }
+                }
+                let lighting = Lighting {
+                    enhanced: true,
+                    shadows: false,
+                    fog_density: 0.0,
+                    wetness,
+                    ..Default::default()
+                };
+                let actual = renderer
+                    .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                    .unwrap();
+                let pp = renderer.hdr_pass.as_mut().unwrap();
+                let mut saved = Vec::new();
+                for variant in 0..4 {
+                    let original = pp.pipelines[PIPE_BLEND_NO_WRITE as usize * 4 + variant].clone();
+                    saved.push(std::mem::replace(
+                        &mut pp.pipelines[PIPE_TERRAIN_PAINT as usize * 4 + variant],
+                        original,
+                    ));
+                }
+                let expected = renderer
+                    .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                    .unwrap();
+                for (variant, pipeline) in saved.into_iter().enumerate() {
+                    renderer.hdr_pass.as_mut().unwrap().pipelines
+                        [PIPE_TERRAIN_PAINT as usize * 4 + variant] = pipeline;
+                }
+                let delta = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    delta <= 2,
+                    "paint composition changed by {delta}: MSAA {msaa}, wet {wetness}, water {water}"
+                );
+                let centre = &actual[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 3];
+                if debug_view() <= 0.5 {
+                    assert!(
+                        centre[2] > centre[0] + 30 && centre[2] > centre[1] + 30,
+                        "paint hid the road: {centre:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn a_freed_and_recycled_mesh_slot_is_no_longer_counted_as_reshaped() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        scene.cache_bounds = true;
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Opaque, [1.0; 4], true);
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let pose = |scale: f32| -> Vec<Vec3> { data.positions.iter().map(|p| *p * scale).collect() };
+        let (once_skinned, skinned) = (renderer.add_mesh(&mut scene, &data), renderer.add_mesh(&mut scene, &data));
+        let first = renderer.add_instance(&mut scene, skinned, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        renderer.update_mesh(&mut scene, once_skinned, &pose(2.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        // the slot is freed and taken by a plain mesh, which a whole tile then draws
+        renderer.free_mesh(&mut scene, once_skinned);
+        renderer.prepare(&mut scene);
+        let plain = renderer.add_mesh(&mut scene, &data);
+        assert_eq!(renderer.recycle_mesh(&mut scene, plain, once_skinned), once_skinned);
+        let tile: Vec<usize> = (0..200).map(|k| renderer.add_instance(&mut scene, once_skinned, DVec3::new(k as f64, 0.0, 0.0), Mat4::IDENTITY, vec![material])).collect();
+        renderer.prepare(&mut scene);
+        renderer.update_mesh(&mut scene, skinned, &pose(7.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        assert!(scene.bounds_users.len() <= 2, "{} instances rescanned", scene.bounds_users.len());
+        let expected = InstanceBounds::new(&scene.meshes[skinned], Mat4::IDENTITY);
+        assert_eq!(scene.instances[first].bounds.radius, expected.radius);
+        let plain_bounds = InstanceBounds::new(&scene.meshes[once_skinned], Mat4::IDENTITY);
+        assert_eq!(scene.instances[tile[42]].bounds.radius, plain_bounds.radius);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn materials_that_look_alike_are_batched_together_whenever_they_were_made() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        let image = omsi_texture::Image { width: 1, height: 1, rgba: vec![200, 100, 50, 255], has_alpha: false };
+        let texture = renderer.add_texture(&mut scene, &image, true);
+        let a = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [1.0; 4], false);
+        renderer.prepare(&mut scene);
+        let b = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [1.0; 4], false);
+        let c = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [0.5, 0.5, 0.5, 1.0], false);
+        let other = renderer.add_texture(&mut scene, &image, true);
+        let d = renderer.add_material(&mut scene, Some(other), AlphaMode::Opaque, [1.0; 4], false);
+        let look = |scene: &Scene, m: MaterialId| scene.materials[m].look;
+        assert_ne!(scene.materials[a].bind_group, scene.materials[b].bind_group);
+        assert_eq!(look(&scene, a), look(&scene, b));
+        assert_ne!(look(&scene, a), look(&scene, c));
+        assert_ne!(look(&scene, a), look(&scene, d));
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let mesh = renderer.add_mesh(&mut scene, &data);
+        let instances: Vec<usize> = [a, c, b, d]
+            .iter()
+            .map(|&m| renderer.add_instance(&mut scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![m]))
+            .collect();
+        renderer.prepare(&mut scene);
+        let mut items: Vec<DrawItem> = instances
+            .iter()
+            .map(|&i| {
+                let material = scene.instances[i].materials[0];
+                DrawItem { pipe: 0, mesh: mesh as u32, range: 0, material: material as u32, look: look(&scene, material), entry: scene.instances[i].base }
+            })
+            .collect();
+        let (mut list, mut batches) = (Vec::new(), Vec::new());
+        batch_items(&scene, &mut items, true, &mut list, &mut batches);
+        assert_eq!(batches.len(), 3);
+        let shared = batches.iter().find(|b| b.instances.len() == 2).expect("a and b in one batch");
+        assert!(shared.material == a as u32 || shared.material == b as u32);
+        let mut entries: Vec<u32> = list[shared.instances.start as usize..shared.instances.end as usize].to_vec();
+        entries.sort_unstable();
+        assert_eq!(entries, vec![scene.instances[instances[0]].base, scene.instances[instances[2]].base]);
     }
 
     #[test]
@@ -13249,6 +14175,8 @@ mod tests {
         use wgpu::naga;
         let modules = [
             ("scene", scene_shader_source(false)),
+            ("scene opaque", scene_shader_source(false)),
+            ("scene terrain paint", scene_shader_source(false)),
             ("sky", sky_shader_source()),
             ("corona", corona_shader_source()),
             ("post", include_str!("post.wgsl").to_string()),
@@ -13283,12 +14211,19 @@ mod tests {
             )
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            // the backends take no override: resolved to their defaults as wgpu does
+            // Exercise the painted-ground specialization as well as the default shader.
+            let mut constants = naga::back::PipelineConstants::default();
+            if name.starts_with("scene ") {
+                constants.insert("ALPHA_TEST".into(), 0.0);
+            }
+            if *name == "scene terrain paint" {
+                constants.insert("TERRAIN_PAINT".into(), 1.0);
+            }
             let (module, info) = naga::back::pipeline_constants::process_overrides(
                 &module,
                 &info,
                 None,
-                &Default::default(),
+                &constants,
             )
             .unwrap_or_else(|e| panic!("{name}: overrides: {e:?}"));
             let (module, info) = (module.into_owned(), info.into_owned());
@@ -13358,8 +14293,10 @@ mod tests {
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
             .expect("validate");
+        let constants = [("ALPHA_TEST".into(), 0.0), ("TERRAIN_PAINT".into(), 1.0)]
+            .into_iter().collect();
         let (module, info) =
-            naga::back::pipeline_constants::process_overrides(&module, &info, None, &Default::default()).expect("overrides");
+            naga::back::pipeline_constants::process_overrides(&module, &info, None, &constants).expect("overrides");
         for version in [glsl::Version::Embedded { version: 310, is_webgl: false }, glsl::Version::Desktop(430)] {
             let options = glsl::Options { version, ..Default::default() };
             for entry in &module.entry_points {

@@ -4,6 +4,60 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 [docs/VERSIONING.md](docs/VERSIONING.md)); the downloads are on the
 [Releases](https://github.com/openOMSI-Project/openOMSI/releases) page.
 
+## 0.1.1726 - 2026-10-05
+
+### Merged pull requests
+- Controllers: a gilrs panic on a controller's first event no longer ends the game on Windows [#1537](https://github.com/openOMSI-Project/openOMSI/pull/1537); an idle joystick nobody set up no longer takes the arrow keys for looking [#1548](https://github.com/openOMSI-Project/openOMSI/pull/1548).
+- Czech and Slovak content is read as Windows-1250, so stop names keep their ř, ě and ů [#1542](https://github.com/openOMSI-Project/openOMSI/pull/1542).
+- A `.owt` weather's second `[temp]` value is read as the dew point: winter weathers give the scripts a real humidity (exhaust steam in the frost, the heating's misted panes) [#1533](https://github.com/openOMSI-Project/openOMSI/pull/1533).
+- Destinations of legacy depot files show their names in the menu and on the displays, and a destination picked by hand runs the scripts' own trigger, as in OMSI 2 [#1535](https://github.com/openOMSI-Project/openOMSI/pull/1535).
+- Vulkan: running out of graphics memory on a demanding map frees the old render targets before falling back, and far textures are reduced right after streaming [#1551](https://github.com/openOMSI-Project/openOMSI/pull/1551).
+
+## 0.1.1711 - 2026-10-05
+
+### Fixes
+- The launcher's download of a server's map and buses before joining (#1486, with #1511) is taken out again for now.
+- The switches for sharing and downloading mods in multiplayer (#1432) are taken out again for now.
+
+## 0.1.1707 - 2026-10-05
+
+### Merged pull requests
+- Headlamps in Enhanced and Enhanced+ light the road as real ones do: evenly from the bumper on, wide, with a low beam's cut-off, instead of one bright pool where the lamp's axis meets the road; lamps pointing down (over a door) keep their cone [#1522](https://github.com/openOMSI-Project/openOMSI/pull/1522).
+- Performance: meshes share pages of vertex and index buffers, about a third less drawing work on the CPU; Enhanced+ keeps one ray tracing structure per mesh in its page [#1340](https://github.com/openOMSI-Project/openOMSI/pull/1340).
+- Catalan as an interface language [#1521](https://github.com/openOMSI-Project/openOMSI/pull/1521); Portuguese (Brazil and Portugal) complete again [#1501](https://github.com/openOMSI-Project/openOMSI/pull/1501).
+- Launcher: buttons that set the start to the current time and date [#1517](https://github.com/openOMSI-Project/openOMSI/pull/1517); no automatic update from a server while downloading missing mods is off [#1511](https://github.com/openOMSI-Project/openOMSI/pull/1511).
+- The personnel file stores late arrivals before early departures, as OMSI 2 does: the counts no longer swap between the two games [#1499](https://github.com/openOMSI-Project/openOMSI/pull/1499).
+- Dependency updates [#1510](https://github.com/openOMSI-Project/openOMSI/pull/1510) [#1509](https://github.com/openOMSI-Project/openOMSI/pull/1509) [#1508](https://github.com/openOMSI-Project/openOMSI/pull/1508) [#1507](https://github.com/openOMSI-Project/openOMSI/pull/1507) [#1506](https://github.com/openOMSI-Project/openOMSI/pull/1506); a plugin DLL that does not load says the system's reason again.
+
+## 0.1.1674 - 2026-10-05
+
+### Merged pull requests
+- AI trams no longer leave their rails to overtake over the oncoming lane: they wait behind what blocks them [#1512](https://github.com/openOMSI-Project/openOMSI/pull/1512).
+
+## 0.1.1671 - 2026-10-05
+
+### Merged pull requests
+- Junction plates are raised by their height field only where the field covers them: the road connection at U Ruhleben (Berlin-Spandau) is level again, without the gap and the bump, and AI lanes follow the field there too [#1493](https://github.com/openOMSI-Project/openOMSI/pull/1493).
+
+## 0.1.1668 - 2026-10-05
+
+### Merged pull requests
+- Controls: keyboard, wheels and gamepads can be set up while playing [#1382](https://github.com/openOMSI-Project/openOMSI/pull/1382); DirectInput wheels recover after a failed read or a replug, retrying a device that will not open at growing intervals [#1489](https://github.com/openOMSI-Project/openOMSI/pull/1489); H-pattern shifters can return to neutral when a gear is let go [#1490](https://github.com/openOMSI-Project/openOMSI/pull/1490); stale gamepad events after a focus change are ignored [#1388](https://github.com/openOMSI-Project/openOMSI/pull/1388); the menu shows the default keys of the timetable (Insert) and the information bar (Shift+Y) [#1425](https://github.com/openOMSI-Project/openOMSI/pull/1425).
+- VR: the head's pitch is applied [#1373](https://github.com/openOMSI-Project/openOMSI/pull/1373).
+- Launcher: the roadbook keeps a picked trip when the start follows the real time [#1460](https://github.com/openOMSI-Project/openOMSI/pull/1460); the tour list filters by route or stop, starts at the trip found and hides ended tours [#1461](https://github.com/openOMSI-Project/openOMSI/pull/1461); a shared `HOFs` folder serves every vehicle, listed in the depot too [#1491](https://github.com/openOMSI-Project/openOMSI/pull/1491); the map zooms smoothly on big maps [#1139](https://github.com/openOMSI-Project/openOMSI/pull/1139).
+- Multiplayer: joining players get the map's ground textures [#1485](https://github.com/openOMSI-Project/openOMSI/pull/1485); the launcher downloads a server's map and buses before joining, and only changed files update by themselves [#1486](https://github.com/openOMSI-Project/openOMSI/pull/1486); controls for mod transfers [#1432](https://github.com/openOMSI-Project/openOMSI/pull/1432); a game the server sends or turns away ends and says why, while a refused reconnect plays on [#1429](https://github.com/openOMSI-Project/openOMSI/pull/1429); traffic light cycles no longer stall on simultaneous inactive events [#1398](https://github.com/openOMSI-Project/openOMSI/pull/1398) and stay under the host's clock [#1399](https://github.com/openOMSI-Project/openOMSI/pull/1399); a host's natural weather or weather cycle reaches the clients.
+- Lua plugins: crash, pedestrian and skipped-stops events, trip, stop and vehicle details in `omsi.info()` [#1447](https://github.com/openOMSI-Project/openOMSI/pull/1447); `omsi.send` sends UDP messages (up to 8 KB) to other programs on this computer [#1448](https://github.com/openOMSI-Project/openOMSI/pull/1448); `.opl` plugins read the game's values through `openomsi_*` variables [#1361](https://github.com/openOMSI-Project/openOMSI/pull/1361).
+- Graphics: trees' pictures are no longer repeated and have no line along their top [#1480](https://github.com/openOMSI-Project/openOMSI/pull/1480); no invisible road walls from thin triangles [#1454](https://github.com/openOMSI-Project/openOMSI/pull/1454); the high cloud layer's noise no longer jitters [#1357](https://github.com/openOMSI-Project/openOMSI/pull/1357); transparent terrain costs less [#1426](https://github.com/openOMSI-Project/openOMSI/pull/1426); MSAA depth prepass for mixed-material views on Apple GPUs [#1465](https://github.com/openOMSI-Project/openOMSI/pull/1465); lamps light the walls next to them softer and a doubled maplight counts once [#1372](https://github.com/openOMSI-Project/openOMSI/pull/1372); OpenGL no longer deadlocks prefetching vehicles [#1416](https://github.com/openOMSI-Project/openOMSI/pull/1416).
+- Performance: a new pose rescans only the instances drawing reshaped meshes [#1466](https://github.com/openOMSI-Project/openOMSI/pull/1466); draws of materials that look alike are batched together [#1456](https://github.com/openOMSI-Project/openOMSI/pull/1456).
+- Translations: Traditional Chinese expanded [#1445](https://github.com/openOMSI-Project/openOMSI/pull/1445).
+- Build: the whole workspace's tests run on Windows and Linux before a release [#1431](https://github.com/openOMSI-Project/openOMSI/pull/1431); shared crates declared once, an unused patch fails the audit, Dependabot waits a week [#1403](https://github.com/openOMSI-Project/openOMSI/pull/1403) and updates wgpu with naga [#1370](https://github.com/openOMSI-Project/openOMSI/pull/1370); dependency updates [#1349](https://github.com/openOMSI-Project/openOMSI/pull/1349) [#1352](https://github.com/openOMSI-Project/openOMSI/pull/1352) [#1347](https://github.com/openOMSI-Project/openOMSI/pull/1347) [#1353](https://github.com/openOMSI-Project/openOMSI/pull/1353).
+
+## 0.1.1554 - 2026-10-05
+
+### Fixes
+- Enhanced+ ray tracing works on Windows and Linux again (RTX and RDNA 2 cards and newer, Direct3D 12 and Vulkan), not only on Apple silicon: on Direct3D 12 its shaders were refused by the shader compiler, so every frame was thrown away and the picture stood still on the loading screen. Cut-out leaves and fences also cast their full traced shadows on Vulkan and Direct3D 12 now.
+- Should a graphics driver refuse the ray tracing all the same, Enhanced+ falls back to Enhanced instead of freezing.
+
 ## 0.1.1553 - 2026-10-05
 
 ### Fixes

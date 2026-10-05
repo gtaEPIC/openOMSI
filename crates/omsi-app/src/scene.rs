@@ -4624,55 +4624,21 @@ impl World {
             // type (0x7c5934), and the ground under a placement plays no part (nor is it
             // pressed onto the field, see `final_ground`). Left flat more than 12 m from the
             // ground, London Bridge's deck met neither of its roads (#961).
-            // the base mesh in object space, as a height lookup
-            let height_of = |x: f32, y: f32| -> Option<f32> {
-                let mut best: Option<f32> = None;
-                for t in base.indices.chunks_exact(3) {
-                    let (a, b, c) = (
-                        base.positions[t[0] as usize],
-                        base.positions[t[1] as usize],
-                        base.positions[t[2] as usize],
-                    );
-                    let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
-                    if det.abs() < 1e-9 {
-                        continue;
-                    }
-                    let l1 = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / det;
-                    let l2 = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / det;
-                    let l0 = 1.0 - l1 - l2;
-                    if l0 >= -1e-4 && l1 >= -1e-4 && l2 >= -1e-4 {
-                        let h = l0 * a.z + l2 * b.z + l1 * c.z;
-                        best = Some(best.map_or(h, |o: f32| o.max(h)));
-                    }
-                }
-                best
-            };
-            // `[crossing_heightdeformation]` is a height field in the plate's own frame (a
-            // plane or a few faces around 0): every vertex of the plate is raised by it where
-            // it stands, and the ground is pressed onto the same field (`final_ground`). The
-            // Juliusturm junction's field is a 3.5 % plane, -0.62 m under its west arm and
-            // +0.76 m under its east one - exactly where the roads arriving and leaving lie
-            // (34.91 and 36.29 m round the plate's 35.53 m). Pressed onto the terrain and the
-            // nearby roads instead, the plate sagged into a trough with a 0.8 m wall at one
-            // end. Past the field's edge a vertex takes the height of its nearest corner.
-            let corners: Vec<glam::Vec3> = base.positions.clone();
+            // The Juliusturm junction's field is a 3.5 % plane, -0.62 m under its west
+            // arm and +0.76 m under its east one: adding these offsets to the plate's
+            // 35.53 m base puts its arms at the arriving roads' 34.91 and 36.29 m.
+            // Deforming the plate to the terrain and nearby roads instead of its own
+            // field previously made it sag into a trough with a 0.8 m wall at one end.
+            // Only vertices covered by the object's height field are displaced. A
+            // vertical ray missing the field leaves the authored height unchanged;
+            // extending corner heights beyond it lifts otherwise level road entrances.
             let mut meshes = Vec::with_capacity(ot.meshes.len());
             let mut moved = 0usize;
             let mut biggest = 0f32;
             for (mesh, _, _) in &ot.meshes {
                 let mut m = mesh.clone();
                 for v in m.positions.iter_mut() {
-                    let d = height_of(v.x, v.y).unwrap_or_else(|| {
-                        corners
-                            .iter()
-                            .min_by(|p, q| {
-                                (p.truncate() - v.truncate())
-                                    .length_squared()
-                                    .total_cmp(&(q.truncate() - v.truncate()).length_squared())
-                            })
-                            .map(|p| p.z)
-                            .unwrap_or(0.0)
-                    });
+                    let Some(d) = field_height(base, v.x, v.y) else { continue };
                     if d.abs() > 0.001 {
                         v.z += d;
                         moved += 1;
@@ -5075,8 +5041,9 @@ impl World {
                         l.refresh();
                     }
                 }
-                // a junction plate raised by its height field carries its paths with it
-                if let (Some(field), true) = (ot.deform.as_ref(), res.warped.contains_key(&oi)) {
+                // Paths sample the field independently of the visual mesh: a coarse
+                // mesh can have no covered vertices while lane points lie inside it.
+                if let Some(field) = ot.deform.as_ref() {
                     let inv = xf.inverse();
                     for l in own.iter_mut() {
                         for q in l.points.iter_mut() {
@@ -5268,7 +5235,10 @@ impl World {
                         switch: sw,
                     });
                 }
-                for ml in &ot.sco.map_lights {
+                for (k, ml) in ot.sco.map_lights.iter().enumerate() {
+                    if ot.sco.map_lights[..k].iter().any(|o| o.pos == ml.pos && o.color == ml.color && o.radius == ml.radius) {
+                        continue;
+                    }
                     let p = xf.transform_point3(glam::Vec3::from(ml.pos)).as_dvec3() + pos;
                     // `[maplight] … radius` is the core the light fills at full colour; it
                     // fades inverse-square beyond and is cut off at six times that. The
@@ -7091,6 +7061,8 @@ impl World {
                         if !gpu.trees.contains_key(&tkey) {
                             let dirs = ot.texture_dirs(&self.root);
                             let found = gpu.texture(renderer, scene, texture, &dirs, images);
+                            // (not repeated: the picture's bottom row, a wide trunk or grass, drew a line along the top of the card)
+                            renderer.address_next.set(omsi_render::TexAddressing::Clamp);
                             let m = renderer.add_material_extra(
                                 scene,
                                 found.as_ref().map(|f| f.0),
@@ -11244,6 +11216,7 @@ pub struct VehiclePrefetch {
     meshes_on_gpu: Arc<Mutex<HashMap<(PathBuf, usize), (MeshId, usize)>>>,
     ready: Arc<Mutex<PreparedVehicles>>,
     gpu: (wgpu::Device, wgpu::Queue),
+    mesh_pages: bool,
 }
 
 /// Vehicle meshes and textures made on a worker, by (bus file, mesh) and by file.
@@ -11256,6 +11229,11 @@ struct PreparedVehicles {
 impl VehiclePrefetch {
     /// Read what uploading `vt` in `scheme` will ask for and the GPU does not have.
     pub fn prefetch(&self, vt: &omsi_sim::VehicleType, scheme: Option<usize>) {
+        // OpenGL has one adapter context; GPU uploads from this worker can time out while
+        // the render thread holds it, so let the normal vehicle upload handle them.
+        if omsi_render::gl_backend() {
+            return;
+        }
         for (name, dirs) in vehicle_texture_names(&self.root, vt, scheme) {
             let refs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
             let Some(path) = omsi_texture::find_texture(&name, &refs) else {
@@ -11302,6 +11280,7 @@ impl VehiclePrefetch {
                     .or_insert((t, data.format));
             }
         }
+        let mut todo = Vec::new();
         for i in 0..vt.meshes.len() {
             let key = (vt.def.path.clone(), i);
             if self.meshes_on_gpu.lock().contains_key(&key)
@@ -11310,9 +11289,14 @@ impl VehiclePrefetch {
                 continue;
             }
             if let Some(d) = vt.mesh_data(i) {
-                let m = omsi_render::prepare_mesh(&self.gpu.0, &self.gpu.1, &d);
-                self.ready.lock().meshes.entry(key).or_insert(m);
+                todo.push((key, d));
             }
+        }
+        let data: Vec<&omsi_geometry::MeshData> = todo.iter().map(|(_, d)| d.as_ref()).collect();
+        let meshes = omsi_render::prepare_meshes(&self.gpu.0, &self.gpu.1, &data, self.mesh_pages);
+        let mut ready = self.ready.lock();
+        for ((key, _), m) in todo.into_iter().zip(meshes) {
+            ready.meshes.entry(key).or_insert(m);
         }
     }
 }
@@ -11469,6 +11453,7 @@ impl World {
             meshes_on_gpu: self.vehicle_meshes.clone(),
             ready: self.vehicle_ready.clone(),
             gpu: (renderer.device.clone(), renderer.queue.clone()),
+            mesh_pages: renderer.mesh_pages(),
         }
     }
 
@@ -13790,6 +13775,10 @@ mod tests {
 #[cfg(test)]
 #[path = "scene/terrain_mapping_tests.rs"]
 mod terrain_mapping_tests;
+
+#[cfg(test)]
+#[path = "scene/crossing_deformation_tests.rs"]
+mod crossing_deformation_tests;
 
 #[cfg(test)]
 mod material_tests {
