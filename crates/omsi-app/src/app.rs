@@ -160,6 +160,9 @@ pub(crate) struct App {
     pub(crate) menu_kbd: bool,
     /// Keys pressed (true) and let go since the Lua plugins' last frame.
     pub(crate) plugin_keys: Vec<(String, bool)>,
+    /// What happened since the Lua plugins' last frame: crashes, people knocked down,
+    /// stops skipped (see `plugins::queue_event`).
+    pub(crate) plugin_events: Vec<omsi_plugin::GameEvent>,
     /// Seconds Ctrl+Shift+Page Up/Down has been held (the clock runs faster the longer).
     pub(crate) clock_hold: f32,
     /// A controller button held for looking left, right, up, down (`view_look_*`).
@@ -251,6 +254,9 @@ pub(crate) struct App {
     pub(crate) own_keys: std::collections::HashSet<i32>,
     /// The same for keys held with Shift (a Shift+number of the player's own is not a door key).
     pub(crate) own_shift: std::collections::HashSet<i32>,
+    /// A binding chosen in the pause menu that is waiting for the next physical key:
+    /// (true: [game], false: [vehicles], index in that section).
+    pub(crate) key_capture: Option<(bool, usize)>,
     /// Whether the game stood paused before the menu opened (closing it goes back to that).
     pub(crate) menu_prev_pause: bool,
     /// OMSI's information bar (`view_toggle_informationdisplay`, Ctrl+Y): time, speed, the
@@ -1004,17 +1010,23 @@ impl App {
             Some(Instant::now() + std::time::Duration::from_millis(2)),
         );
         w.update_texture_budget(r, scene, &centers, false);
-        if centers.is_empty()
-            || !streamer.update(
+        if centers.is_empty() {
+            return;
+        }
+        let changed = streamer.update(
             r,
             scene,
             &centers,
             std::time::Duration::from_millis(6),
             self.audio.as_ref(),
-        )
-        {
+        );
+        // Uploads can temporarily exceed the texture budget before the next frame's
+        // housekeeping pass. Recheck immediately after streaming so far textures are
+        // reduced before the renderer allocates more frame resources.
+        if !changed {
             return;
         }
+        w.update_texture_budget(r, scene, &centers, true);
         if let Some(p) = self.player.as_mut() {
             // (OMSI's [no_collision]: no solid object stops the bus)
             p.vehicle.collision = self.settings.collision_objects.then(|| w.collision.lock().clone());

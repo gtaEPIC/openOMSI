@@ -349,9 +349,9 @@ moment, with a camera's middle-tone contrast; street lamps are bright points wit
 glare in clear air and wide halos in mist and rain.
 
 `graphics=enhanced_plus` (Enhanced+ in the launcher, `--enhanced-plus`) is Enhanced with
-hardware ray tracing, where the graphics card traces rays (Apple M3/M4 and newer; on
-Vulkan and Direct3D 12 the ray tracing of the graphics library is still experimental, so
-there Enhanced+ draws as Enhanced for now - `OMSI_RT=1` tries it on an RTX or RDNA 2 card). Every solid mesh within
+hardware ray tracing, where the graphics card traces rays (Apple M3/M4 and newer, RTX and
+RDNA 2 cards and newer through Vulkan and Direct3D 12; elsewhere it draws as Enhanced, and
+should a driver refuse the ray tracing it falls back to Enhanced as well). Every solid mesh within
 420 m of the camera goes into an acceleration structure each frame, and the window's
 picture traces the sun's shadow per pixel (soft away from its caster, crisp at the
 contact; cut-out leaves and fences keep the shadow map, whose texels they need), the
@@ -457,6 +457,11 @@ installation - `Vehicles`, `maps`, `Sceneryobjects`, `Splines`, `Texture`, `Font
 folder (`omsi_cfg::content_roots`): whatever a mod puts there is found exactly as if it had
 been copied into OMSI 2, and a file of the same name replaces the stock one. The original
 installation is never written to. `OMSI_CONTENT=/some/dir` moves the content folder.
+
+Depot files can also be placed in a top-level `HOFs/` folder. Every vehicle can use those
+`.hof` files without keeping a separate copy in each `Vehicles/<bus>/` folder. If a
+vehicle folder and `HOFs/` contain the same file name, the vehicle's own copy takes
+priority (the launcher's depot list shows the shared ones after the bus's own).
 
 Installing a mod: the launcher's **Mods** page opens the system's folder / file picker
 (Finder, Explorer, GTK) for a mod folder or a `.zip`, `.7z` or `.rar` archive and sorts it

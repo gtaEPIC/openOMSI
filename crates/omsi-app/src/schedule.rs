@@ -3400,15 +3400,22 @@ fn set_destination_at(
     };
     // the original's way: SetLineTo + AI_target_index, then the ai_scheduled_settarget trigger
     set_line_to(v, line);
-    if !player {
-        v.set_var("AI_target_index", ti as f32);
-        if v.trigger("ai_scheduled_settarget") {
-            v.set_var(
-                "IBIS_RouteIndex",
-                route_index.map(|r| r as f32).unwrap_or(-1.0),
-            );
-            return;
+    v.set_var("AI_target_index", ti as f32);
+    let pending_blind = player.then(|| v.var("rlbnd_ziel_target")).flatten();
+    let target_triggered = v.trigger("ai_scheduled_settarget");
+    // The trigger also feeds destination displays, but a hand-cranked blind must remain
+    // pending until `turn_roller_blind` applies the driver's selection.
+    if player {
+        if let Some(row) = pending_blind {
+            v.set_var("rlbnd_ziel_target", row);
         }
+    }
+    if !player && target_triggered {
+        v.set_var(
+            "IBIS_RouteIndex",
+            route_index.map(|r| r as f32).unwrap_or(-1.0),
+        );
+        return;
     }
     v.set_var("IBIS_LinieKurs", line_num);
     v.set_var("IBIS_Linie_Complex", line_code as f32);
@@ -3428,7 +3435,7 @@ fn set_destination_at(
     set_str(
         v,
         "IBIS_terminus_name",
-        hof.termini[ti].strings.first().cloned().unwrap_or_default(),
+        hof.termini[ti].display_name(),
     );
     let complex = if line_num > 0.0 {
         complex_line_text(line, line_num)
@@ -3576,6 +3583,8 @@ pub struct PlayerDuty {
     placed: bool,
     /// The current trip changed since the last `take_trip_change`.
     trip_changed: bool,
+    /// Stops the bus passed without stopping since the last `take_skipped` (see `catch_up`).
+    skipped: Option<(usize, usize, usize)>,
     /// The player picked the current trip: the duty does not move on past it before it is
     /// driven (or given up), however late the bus is for it.
     picked: bool,
@@ -3936,6 +3945,7 @@ impl Schedule {
             held_back: false,
             placed: false,
             trip_changed: false,
+            skipped: None,
             picked: trip.map(|t| !t.trim().is_empty()).unwrap_or(false),
             first_update: None,
             heading: 0.0,
@@ -4336,6 +4346,13 @@ impl PlayerDuty {
     /// Whether the current trip changed since the last call (the IBIS wants the new one).
     pub fn take_trip_change(&mut self) -> bool {
         std::mem::take(&mut self.trip_changed)
+    }
+
+    /// The stops the bus passed without stopping since the last call: how many, the stop it
+    /// was due at and the one it is at now (numbers in the trip, from 1). Lua plugins get
+    /// it as the `stops_skipped` event.
+    pub fn take_skipped(&mut self) -> Option<(usize, usize, usize)> {
+        self.skipped.take()
     }
 
     /// How late the bus arrived at the stop it stands at (s; negative: early), None while it
@@ -4794,6 +4811,7 @@ impl PlayerDuty {
             trip.stops[k].name.trim(),
             self.next_stop + 1
         );
+        self.skipped = Some((k - self.next_stop, self.next_stop + 1, k + 1));
         self.next_stop = k;
     }
 
@@ -5402,6 +5420,17 @@ pub(crate) mod tests {
         assert_eq!(set_player_destination_at(&mut ibis, &hof, "145", 1, &[]), None);
     }
 
+    #[test]
+    fn a_destination_picked_from_the_list_updates_display_target() {
+        let osc = "{trigger:ai_scheduled_settarget}\n(L.L.AI_target_index) (S.L.display_target)\n{end}\n";
+        let vars = "IBIS_LinieKurs\nIBIS_TerminusIndex\nIBIS_TerminusCode\nAI_target_index\ndisplay_target\n";
+        let t = |code: i32, id: &str| omsi_vehicle::hof::Terminus { code, texture_id: id.into(), strings: vec![id.into()], ..Default::default() };
+        let hof = omsi_vehicle::Hof { termini: vec![t(100, "First"), t(200, "Second")], ..Default::default() };
+        let mut v = script_test_vehicle(osc, vars, "IBIS_terminus_name\n");
+        set_player_destination_at(&mut v, &hof, "10", 1, &[]);
+        assert_eq!(v.var("display_target"), Some(1.0));
+    }
+
     /// A route number set by hand keeps the destination a roller blind shows: the row it
     /// was cranked to, of which the IBIS knows nothing (taken from the IBIS, at its empty
     /// row, a route pick turned the blind back to Empty), its plug-in sign's where one is up,
@@ -5508,6 +5537,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5627,6 +5657,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: false,
             trip_changed: false,
+            skipped: None,
             picked: false,
             first_update: None,
             heading: 90.0,
@@ -5709,6 +5740,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5747,6 +5779,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5781,6 +5814,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5794,7 +5828,7 @@ pub(crate) mod tests {
     fn the_next_stop_can_be_skipped() {
         let trip = planned(0.0, &[(0.0, 0.0, 0.0), (100.0, 60.0, 60.0), (500.0, 120.0, 120.0), (1000.0, 200.0, 200.0)]);
         let next = planned(400.0, &[(1040.0, 400.0, 400.0), (1500.0, 500.0, 500.0)]);
-        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip, next], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, served_terminus: None, left_late: None, held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip, next], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, served_terminus: None, left_late: None, held_back: false, placed: true, trip_changed: false, skipped: None, picked: true, first_update: None, heading: 90.0 };
         // at the first stop and away from it: the next is s1
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
         d.advance(glam::DVec3::new(50.0, 0.0, 0.0), 10.0);
@@ -5841,6 +5875,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5891,6 +5926,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: true,
             trip_changed: false,
+            skipped: None,
             picked: true,
             first_update: None,
             heading: 90.0,
@@ -5903,6 +5939,41 @@ pub(crate) mod tests {
         d.advance(glam::DVec3::new(100.0, 0.0, 0.0), 60.0);
         d.advance(glam::DVec3::new(140.0, 0.0, 0.0), 70.0);
         assert_eq!(d.next_stop, 2, "the duty goes on to stop 2, not over the road to stop 5");
+    }
+
+    #[test]
+    fn stops_passed_without_stopping_are_told_once() {
+        let mut trip = planned(0.0, &[(0.0, 0.0, 0.0), (100.0, 60.0, 60.0), (500.0, 120.0, 120.0), (1000.0, 200.0, 200.0), (1500.0, 280.0, 280.0)]);
+        trip.set_dirs();
+        let mut d = PlayerDuty {
+            line: "5".into(),
+            tour: "1".into(),
+            trips: vec![trip],
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            served_terminus: None,
+            left_late: None,
+            held_back: false,
+            placed: true,
+            trip_changed: false,
+            skipped: None,
+            picked: true,
+            first_update: None,
+            heading: 90.0,
+        };
+        d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
+        d.advance(glam::DVec3::new(60.0, 0.0, 0.0), 30.0);
+        assert_eq!(d.next_stop, 1);
+        assert_eq!(d.take_skipped(), None, "leaving a stop served skips none");
+        // the bus turns up at stop 4 (numbered from 1) heading on: stops 2 and 3 were passed
+        d.advance(glam::DVec3::new(1000.0, 0.0, 0.0), 90.0);
+        assert_eq!(d.next_stop, 3);
+        assert_eq!(d.take_skipped(), Some((2, 2, 4)), "two stops, due at 2, now at 4");
+        assert_eq!(d.take_skipped(), None, "told once");
     }
 
     #[test]
@@ -5958,6 +6029,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: false,
             trip_changed: false,
+            skipped: None,
             picked: false,
             first_update: None,
             heading: 0.0,
@@ -6009,6 +6081,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: false,
             trip_changed: false,
+            skipped: None,
             picked: false,
             first_update: None,
             heading: 0.0,
@@ -6051,6 +6124,7 @@ pub(crate) mod tests {
             held_back: false,
             placed: false,
             trip_changed: false,
+            skipped: None,
             picked: false,
             first_update: None,
             heading: 0.0,
