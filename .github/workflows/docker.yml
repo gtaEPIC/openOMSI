@@ -118,11 +118,10 @@ jobs:
       - name: Lint the scripts
         run: shellcheck docker/entrypoint.sh docker/omsi-health docker/omsi-admin docker/omsi-status
 
+      # (hadolint itself, not its GitHub action: the action's older hadolint does not know
+      # HEALTHCHECK --start-interval)
       - name: Lint the Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          failure-threshold: error
+        run: docker run --rm -i hadolint/hadolint:v2.15.1 hadolint --failure-threshold error - < Dockerfile
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
