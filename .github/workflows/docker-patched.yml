@@ -1,0 +1,105 @@
+# The dedicated server's image built from this branch's own code - for fixes servers need
+# before openOMSI-Project releases them - as ghcr.io/<owner>/openomsi-server:patched, on every
+# push to the branch `patched` (and by hand). The usual image, :latest (docker.yml), stays
+# upstream's release: a server takes this one with OPENOMSI_IMAGE=...:patched in its .env, and
+# goes back once upstream has the fix. Keep `patched` merged with upstream's main and push it
+# again after each release: the players' games update to every release, and the server must
+# speak their protocol.
+name: Docker image (patched)
+
+on:
+  push:
+    branches: [patched]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-patched
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: openomsi-server
+  TAG: patched
+
+jobs:
+  # each architecture compiled on a machine of its own (Rust under emulation takes hours)
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # (the whole history: the program's version counts the commits)
+          fetch-depth: 0
+
+      - name: Image name
+        id: name
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "image=$REGISTRY/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          pull: true
+          push: true
+          # (a plain image per architecture; the next job puts both under one tag)
+          provenance: false
+          tags: ${{ steps.name.outputs.image }}:${{ env.TAG }}-${{ matrix.arch }}
+          build-args: |
+            BINARY=source
+          labels: |
+            org.opencontainers.image.title=openOMSI dedicated server (patched)
+            org.opencontainers.image.description=The openOMSI dedicated server with fixes not yet released upstream; mount your own OMSI 2 at /omsi2 (docs/DOCKER.md)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: One tag for both architectures
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          image="$REGISTRY/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE"
+          docker buildx imagetools create -t "$image:$TAG" "$image:$TAG-amd64" "$image:$TAG-arm64"
+          docker buildx imagetools inspect "$image:$TAG"
+          echo "### $image:$TAG built from ${GITHUB_SHA::7}" >> "$GITHUB_STEP_SUMMARY"
