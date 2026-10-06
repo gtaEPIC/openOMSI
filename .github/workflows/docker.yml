@@ -1,16 +1,20 @@
 # The dedicated server's container image (Dockerfile, docs/DOCKER.md) in the GitHub Container
 # Registry, ghcr.io/<owner>/openomsi-server:
-# * every half hour (and by hand) it looks for a new release of openOMSI-Project/openOMSI and,
+# * every hour (and by hand) it looks for a new release of openOMSI-Project/openOMSI and,
 #   when that release has no image yet, builds one from its Linux server download for x86-64 and
 #   ARM64: :<version> and :latest. The players' games update to every release by themselves, so
-#   the servers' image follows within the hour - with no change to this repository;
+#   the servers' image follows - with no change to this repository. (GitHub starts scheduled runs
+#   when it has runners to spare, so an hour can turn into several; Release cannot start this
+#   instead: it tags and publishes with GITHUB_TOKEN, which starts no other workflow, and it is
+#   another repository's for a fork);
 # * a change to the image's own files (Dockerfile, docker/) builds the latest release again;
 # * a pull request that changes them is built and tried out, not published.
 name: Docker image
 
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    # (off the hour, when GitHub drops the most scheduled runs)
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       version:
