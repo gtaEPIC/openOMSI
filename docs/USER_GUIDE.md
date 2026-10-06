@@ -283,7 +283,10 @@ the panel's own light, and the glow draws a halo around them), `led_mips` (0..4,
 `\S:n` mask are sampled at the level their screen footprint asks for, never coarser than
 this. 0 point-samples them, the sharpest dots and the worst shimmer; 1.3 keeps a matrix's
 dots a couple of pixels across where the full chain has run them together; 4 is near the
-calm of the full chain), `mouse_sens` (mouse steering,
+calm of the full chain). The bus's own screens in Enhanced (the IBIS, ticket and
+html terminals, the dashboard's LCDs) dim at night as a real dashboard's do, and are never
+lifted over their own colour by the eye's adaptation to the dark cab; the gauges' backlight
+and the destination LED matrices (`led_glow`) are left as they are. `mouse_sens` (mouse steering,
 1 = OMSI's), `mouse_smooth` (0: the mouse's wheel follows the cursor without easing),
 `ui_scale` (the size of the game's interface over the picture - its texts,
 the menu, the timetable, the navigator and the city map - from 0.5 to 2, 1 by default, on
@@ -319,8 +322,10 @@ Who gets on the player's bus: on a duty (a line and tour, or a trip) with a dest
 the display, the people waiting for a stop the trip calls at later - also where the bus's
 depot file (`.hof`) names the terminus otherwise than the map's timetable does - and those
 whose line record lists the terminus shown; everybody gets off at the trip's last stop. In
-free drive, or with no destination set (or a "not in service" one), nobody waiting gets on;
-the riders aboard still get off at their stops.
+free drive the bus takes whom its destination display takes, as a timetable bus: those
+whose line record lists the terminus shown, and those without one. With no destination set
+(or a "not in service" one) nobody waiting gets on; the riders aboard still get off at their
+stops.
 `exact_fare=0` makes them overpay so that change is due. Rain and snow stay outside the
 player's bus (its `[boundingbox]`), and heavy rain darkens the day enough for the saloon
 lights to matter.

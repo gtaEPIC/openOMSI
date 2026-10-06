@@ -476,8 +476,8 @@ pub(super) enum Takes {
     /// however the bus's depot file spells the terminus. `next` is the stop of the trip the
     /// duty is due at, `done` that the trip has reached its last stop.
     Duty { trip: Arc<DutyTrip>, next: usize, done: bool },
-    /// Nobody waiting: the player's bus in free drive (its riders get off as ever), another
-    /// player's bus (their game boards it), a bus the player left standing.
+    /// Nobody waiting: another player's bus (their game boards it), a bus the player left
+    /// standing (its riders get off as ever).
     Nobody,
 }
 
@@ -819,6 +819,11 @@ impl Humans {
                     let in_box = lateral.abs() < 2.0 && along.abs() < (s.length as f64 - 5.0).max(0.0);
                     self.stops.get_mut(id).unwrap().buses.push((bn.id, in_box));
                 }
+            }
+            // a timetable bus boarding at a stop none of these know: its riders get off at
+            // its timetable's stop (#1593)
+            if reg.next.is_none() {
+                reg.next = bn.served;
             }
             out.insert(bn.id, reg);
         }
@@ -2256,13 +2261,13 @@ impl Humans {
                 return;
             }
             // the money on the desk (sub_7e8254)
-            let point = bn.cabin.money_var;
+            let point = bn.cabin.money_var.clone();
             let mut paid = value;
             if let Some(m) = self.money.as_mut() {
                 let coins = if self.exact_fare || auto { m.exact_coins_for(value) } else { m.omsi_coins_for(value) };
                 paid = m.value_of(&coins);
-                if let Some((pos, var)) = point {
-                    m.place(world, renderer, scene, &coins, pos, var, false);
+                if let Some((pos, var, parent)) = point {
+                    m.place(world, renderer, scene, &coins, pos, var, false, parent.as_deref());
                 }
             }
             self.paid = Some((paid, value));

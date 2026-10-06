@@ -71,6 +71,8 @@ struct RunningTrip {
     /// already or has passed.
     stations: Vec<(i64, f64)>,
     served: Vec<bool>,
+    /// Per station: the step of the trip's track it lies on (`station_entries`).
+    entries: Vec<Option<usize>>,
 }
 
 /// When a trip's bus is at each of its stations, as OMSI's timetable has it: the profile
@@ -234,6 +236,34 @@ fn trip_stations(trip: &omsi_timetable::Trip) -> Vec<i64> {
         .iter()
         .filter_map(|s| s.first().and_then(|id| id.trim().parse::<i64>().ok()))
         .collect()
+}
+
+/// The track entry each station of a type-1 trip lies on (its `[station]` record's second
+/// line), None for a trip of station links. A return trip's stop beside the way out (NCC's
+/// hospital: M2 on entry 68, M3 on entry 583) was put on the nearest point of the route and
+/// served on the way out, the bus waiting there an hour for its time (#1592).
+fn station_entries(trip: &omsi_timetable::Trip) -> Vec<Option<usize>> {
+    if !trip.stations.is_empty() {
+        return vec![None; trip.stations.len()];
+    }
+    trip.stations_legacy
+        .iter()
+        .filter(|s| s.first().and_then(|id| id.trim().parse::<i64>().ok()).is_some())
+        .map(|s| s.get(1).and_then(|e| e.trim().parse::<usize>().ok()))
+        .collect()
+}
+
+/// The lanes of `section` (after `bridge_gaps`, `index`) round step `entry` of the trip, when
+/// the steps `first..` gave its lanes (`slots`): where the stop on that entry is looked for.
+/// None when that step is not in the section (not loaded yet).
+fn entry_window(slots: &[Slot], first: usize, entry: usize, index: &[usize], len: usize) -> Option<(usize, usize)> {
+    let k = entry.checked_sub(first)?;
+    if !matches!(slots.get(k), Some(Slot::Lane(_))) {
+        return None;
+    }
+    let pos = slots[..k].iter().filter(|s| matches!(s, Slot::Lane(_))).count();
+    let at = *index.get(pos)?;
+    Some((at.saturating_sub(2), (at + 3).min(len)))
 }
 
 /// How far from a route a bus stop may stand when the route is only a part of the trip (a
@@ -435,6 +465,8 @@ pub struct Schedule {
     /// Departures due while their tour's bus is still on its previous trip: that bus takes
     /// them on when it gets there, as in OMSI a tour keeps its bus from trip to trip.
     awaiting: std::collections::HashSet<usize>,
+    /// The clock was set (`restart`): the next tick puts the buses out as a start does.
+    restarted: bool,
     /// The map's holidays, for the day's tours.
     calendar: omsi_map::Calendar,
     /// The date (yyyymmdd) the departures are for, and the mask bits it selects (day,
@@ -736,6 +768,7 @@ impl Schedule {
             later_layover: Default::default(),
             tour_next,
             awaiting: Default::default(),
+            restarted: false,
             calendar,
             day: date,
             day_bits: (day_bit, school_bit),
@@ -897,6 +930,54 @@ impl Schedule {
         self.assign_car_use();
         let today = (0..self.departures.len()).filter(|&i| self.runs(i)).count();
         log::info!("timetable: a new day ({date}): {today} departures today, {n} made ready to run again");
+    }
+
+    /// The clock was set to another time (by hand, the menu, Ctrl+Shift+Page Up/Down): every
+    /// timetable bus goes, and at the next tick each trip under way at the new time is put
+    /// out where its timetable has it then, as when the game starts - as Omsi.exe does when
+    /// the time is changed. They stayed where they were, the whole timetable running hours
+    /// early or late: buses queued at stops, waiting there for their time (#1607, #1455).
+    pub fn restart(&mut self, world: &World, traffic: &mut Traffic, renderer: &Renderer, scene: &mut Scene, day_time: f64) {
+        if traffic.is_mirror() {
+            return;
+        }
+        let gone: Vec<u64> = self.car_departure.keys().copied().collect();
+        let mut n = 0;
+        for id in gone {
+            self.car_departure.remove(&id);
+            if traffic.remove_car(world, renderer, scene, id) {
+                n += 1;
+            }
+        }
+        self.running.clear();
+        self.pending.clear();
+        self.waiting.clear();
+        self.awaiting.clear();
+        self.retry_at.clear();
+        self.startup.clear();
+        self.later_layover.clear();
+        // (the clock set back over midnight: the day before)
+        while day_time < self.day_base {
+            self.day_base -= DAY;
+            let mut c = self.date_clock.clone();
+            if c.day_of_year > 1 {
+                c.day_of_year -= 1;
+            } else {
+                c.year -= 1;
+                c.day_of_year = omsi_sim::clock::days_in_year(c.year);
+            }
+            self.date_clock = c.clone();
+            self.set_day(&c);
+        }
+        self.roll_day(day_time);
+        for i in 0..self.departures.len() {
+            if !self.is_player_tour(i) {
+                self.departures[i].spawned = false;
+            }
+        }
+        self.last_tod = day_time - self.day_base;
+        self.restarted = true;
+        log::info!("timetable: the clock was set to {}: {n} timetable buses taken off, the trips under way put out again", hhmm(day_time - self.day_base));
     }
 
     /// The timetable bus on the road that runs departure `k` (not one that has been let go).
@@ -1779,6 +1860,7 @@ impl Schedule {
                 }
             }
         }
+        let window = if std::mem::take(&mut self.restarted) { window.max(20.0 * 60.0) } else { window };
         let loading = window > 60.0;
         let due: Vec<usize> = self
             .departures
@@ -1921,6 +2003,7 @@ impl Schedule {
             self.carry_on(world, traffic);
         }
         self.fleet(world, traffic, renderer, scene, day_time);
+        self.feed_ai_hosts(traffic);
         self.tour_handover(world, traffic, renderer, scene, day_time);
         // a handful per call: spawning a bus builds its meshes, and a whole rush hour at
         // once is a frame that lasts seconds (a departure that has to wait costs little)
@@ -1942,6 +2025,28 @@ impl Schedule {
                 }
                 Placed::Drop => {}
             }
+        }
+    }
+
+    /// The timetable buses' stop and delay for their scripts (`GetTTBusstopIndex`,
+    /// `GetTTDelay`; see `feed_ai_timetable`): the stop they are due at next, the delay as of
+    /// the last stop.
+    fn feed_ai_hosts(&self, traffic: &mut Traffic) {
+        for car in traffic.cars.iter_mut().filter(|c| self.car_departure.contains_key(&c.id)) {
+            let Some(b) = car.bus.as_ref() else { continue };
+            let host = &mut car.vehicle.host;
+            if host.tt_stop_ids.is_empty() {
+                continue;
+            }
+            let from = host.tt_busstop_index.max(0) as usize;
+            if let Some(next) = b.stops.front() {
+                if let Some(k) = host.tt_stop_ids.iter().skip(from).position(|id| *id == next.id) {
+                    host.tt_busstop_index = (from + k) as i32;
+                }
+            } else {
+                host.tt_busstop_index = host.tt_stop_ids.len().saturating_sub(1) as i32;
+            }
+            host.tt_delay = b.delay as f32;
         }
     }
 
@@ -1970,15 +2075,16 @@ impl Schedule {
                 })
                 .collect();
             // (bridged from the end of what the bus has)
-            let lanes = match last {
+            let (lanes, index) = match last {
                 Some(l) if !lanes.is_empty() => {
                     let with: Vec<usize> = std::iter::once(l).chain(lanes.iter().copied()).collect();
                     Self::add_connectors(traffic, &with);
-                    bridge_gaps(&traffic.net, &with).0[1..].to_vec()
+                    let (b, ix) = bridge_gaps(&traffic.net, &with);
+                    (b[1..].to_vec(), ix[1..].iter().map(|k| k.saturating_sub(1)).collect::<Vec<_>>())
                 }
                 _ => {
                     Self::add_connectors(traffic, &lanes);
-                    bridge_gaps(&traffic.net, &lanes).0
+                    bridge_gaps(&traffic.net, &lanes)
                 }
             };
             if !lanes.is_empty() {
@@ -1992,9 +2098,15 @@ impl Schedule {
                     let Some((pos, _)) = world.object_positions.lock().get(sid).copied() else {
                         continue;
                     };
-                    if let Some((ri, ss, lat)) =
-                        project_stop(&traffic.net, &lanes, pos, Some(STOP_REACH), from)
-                    {
+                    // (a track's station on its own entry, see `station_entries`)
+                    let found = match run.entries.get(si).copied().flatten() {
+                        Some(e) => match entry_window(&slots[..n], run.next, e, &index, lanes.len()) {
+                            Some((lo, hi)) => project_stop(&traffic.net, &lanes[..hi], pos, Some(STOP_REACH), from.max(lo)),
+                            None => continue,
+                        },
+                        None => project_stop(&traffic.net, &lanes, pos, Some(STOP_REACH), from),
+                    };
+                    if let Some((ri, ss, lat)) = found {
                         from = ri;
                         stops.push((base + ri, ss, bay_offset(lat), *t_dep, *sid, world.stop_side(*sid)));
                         run.served[si] = true;
@@ -2053,6 +2165,7 @@ impl Schedule {
         // (the [station] records of a type-1 trip as well: Novi Sad's buses have no others,
         // and without them they drove past every stop)
         let stations = trip_stations(trip);
+        let entries = station_entries(trip);
         // the timetable's times at the stations (see `TripTimes`)
         let departure = self.dep_time(i);
         let tt = self.times_of(i).clone();
@@ -2165,6 +2278,7 @@ impl Schedule {
         Self::add_connectors(traffic, &section);
         let net = &traffic.net;
         let (section, index) = bridge_gaps(net, &section);
+        let section_slots = &slots[start..end];
         let start_index = index[start_index.min(index.len() - 1)];
         let mut s = offset.min(net.lanes[section[start_index]].length() as f64) as f32;
         // stations → stop points on that part of the route
@@ -2183,8 +2297,25 @@ impl Schedule {
                 served[si] = true;
             }
             let found = world.object_positions.lock().get(sid).copied();
+            // a station of a track: on its own entry (behind the bus: passed; not loaded yet:
+            // looked for when its lanes come)
+            let window = match (track, entries.get(si).copied().flatten()) {
+                (true, Some(e)) if e < at => {
+                    served[si] = true;
+                    continue;
+                }
+                (true, Some(e)) => match entry_window(section_slots, start, e, &index, section.len()) {
+                    Some(w) => Some(w),
+                    None => continue,
+                },
+                _ => None,
+            };
+            let near = |pos: glam::DVec3| match window {
+                Some((lo, hi)) => project_stop(net, &section[..hi], pos, reach.or(Some(STOP_REACH)), from.max(lo)),
+                None => project_stop(net, &section, pos, reach, from),
+            };
             match found {
-                Some((pos, _)) => match project_stop(net, &section, pos, reach, from) {
+                Some((pos, _)) => match near(pos) {
                     Some((ri, ss, lat)) => {
                         from = ri;
                         served[si] = true;
@@ -2299,6 +2430,7 @@ impl Schedule {
             let hof = car.vehicle.host.hof.clone();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             set_ai_destination(&mut car.vehicle, hof.as_deref(), &line, &terminus, &names);
+            feed_ai_timetable(&mut car.vehicle, &line, &terminus, &names, &stations, &arrive, &leave);
             if let Some(b) = car.bus.as_mut() {
                 b.route_open = end < slots.len();
                 b.terminus = terminus.clone();
@@ -2316,6 +2448,7 @@ impl Schedule {
                     next: end,
                     stations: stations.iter().copied().zip(leave.iter().copied()).collect(),
                     served,
+                    entries: if track { entries.clone() } else { Vec::new() },
                 });
             }
             log::info!(
@@ -2504,6 +2637,7 @@ impl Schedule {
             car.vehicle.state.str_vars[i as usize] = line.clone();
         }
         set_ai_destination(&mut car.vehicle, hof.as_deref(), &line, &terminus, &names);
+        feed_ai_timetable(&mut car.vehicle, &line, &terminus, &names, &stations, &arrive, &leave);
         log::info!("scheduled bus: line {line} tour {tour} trip {trip_name} {} #{:?} at {:.1} min, {} stops, at ({:.1}, {:.1}) heading {:.0}{}", ty.def.type_name, number.as_ref().map(|n| format!("{} plate {:?} paint {:?}", n.0, n.1, scheme.and_then(|i| ty.paint_schemes.get(i)).map(|p| p.name.as_str()))), day_time / 60.0, car.bus.as_ref().map(|b| b.stops.len()).unwrap_or(0), car.vehicle.position.x, car.vehicle.position.y, car.vehicle.heading, if end < slots.len() { format!(", route {} of {} steps so far", end - start, steps.len()) } else { String::new() });
         if end < slots.len() {
             self.running.push(RunningTrip {
@@ -2516,6 +2650,7 @@ impl Schedule {
                     .zip(leave.iter().copied())
                     .collect(),
                 served,
+                entries: if track { entries.clone() } else { Vec::new() },
             });
         }
         if profile {
@@ -2742,6 +2877,26 @@ fn depot_file(
     let h = found.map(Arc::new);
     cache.insert(key, h.clone());
     h
+}
+
+/// A timetable bus's own timetable for its scripts, as the player's duty gives it
+/// (`PlayerDuty::feed_host`): `schedule_active`, and the trip's stops and times behind the
+/// `GetTT*` macros. AI buses had none - `schedule_active` 0, an IBIS showing no delay and no
+/// stop list (#1580). [`Schedule::feed_ai_hosts`] keeps the stop and the delay up to date.
+fn feed_ai_timetable(v: &mut omsi_sim::VehicleInstance, line: &str, terminus: &str, names: &[&str], stations: &[i64], arrive: &[f64], leave: &[f64]) {
+    let host = &mut v.host;
+    host.schedule_active = 1.0;
+    host.tt_line = line.to_string();
+    host.tt_stops = stations
+        .iter()
+        .enumerate()
+        .map(|(k, _)| (names.get(k).map(|n| n.to_string()).unwrap_or_default(), arrive.get(k).copied().unwrap_or(0.0) as f32, leave.get(k).copied().unwrap_or(0.0) as f32))
+        .collect();
+    host.tt_stop_ids = stations.to_vec();
+    host.tt_busstop_index = 0;
+    host.tt_terminus_index = tt_terminus_index(host.hof.as_deref(), terminus);
+    host.tt_delay = 0.0;
+    v.set_var("schedule_active", 1.0);
 }
 
 /// Put an AI bus's IBIS onto the line/terminus of its trip: the depot file gives the
@@ -3552,6 +3707,40 @@ pub fn ibis_stop_index(hof: &omsi_vehicle::Hof, route: usize, name: &str, k: usi
         .filter(|(_, id)| same_stop(&ident_names(hof, id), &stop))
         .map(|(i, _)| i)
         .min_by_key(|i| i.abs_diff(k))
+}
+
+/// Route index the unit's stop list uses: stock `IBIS_RouteIndex`, or Aachen's `ibox_routenindex`.
+fn script_route_index(bus: &omsi_sim::VehicleInstance) -> Option<usize> {
+    bus.var("IBIS_RouteIndex")
+        .or_else(|| bus.var("ibox_routenindex"))
+        .filter(|r| *r >= 0.0)
+        .map(|r| r.round() as usize)
+}
+
+/// Align `ibox_busstop` with timetable stop `tt` (named `name`).
+///
+/// (Not `IBIS_busstop`: no stock script reads the timetable's stop index, the stock IBIS
+/// steps on its own keys only - set to the row before, every stock IBIS on a duty ran a
+/// stop behind.) Units such as Aachen's ibox do `(L.L.ibox_busstop) 1 +` when `GetTTBusstopIndex` changes,
+/// so on a forward step the value is left at the previous route index and that `+ 1` lands
+/// on the new one. A backward step (or a resume) writes the index itself and freezes the
+/// ibox's "last TT index" so the frame does not announce again.
+fn sync_script_busstop(bus: &mut omsi_sim::VehicleInstance, tt: usize, name: &str, prev_tt: i32) {
+    let Some(hof) = bus.host.hof.clone() else { return };
+    let Some(route) = script_route_index(bus) else { return };
+    let Some(idx) = ibis_stop_index(&hof, route, name, tt) else { return };
+    let forward = (tt as i32) > prev_tt;
+    let value = if forward { idx.saturating_sub(1) } else { idx };
+    for var in ["ibox_busstop"] {
+        if bus.var(var).is_some() {
+            bus.set_var(var, value as f32);
+        }
+    }
+    if !forward {
+        if bus.var("ibox_TTBusstopIndexLAST").is_some() {
+            bus.set_var("ibox_TTBusstopIndexLAST", tt as f32);
+        }
+    }
 }
 
 /// The player's tour: its trips with planned stop times, and the progress along them.
@@ -4481,7 +4670,12 @@ impl PlayerDuty {
             );
             return;
         }
+        // The first stop's tile may still be unloaded while a later stop already has a
+        // place: snapping `near` to that later stop made GetTTBusstopIndex (Aachen ibox
+        // Fahrplan list) start on stop #2. Keep the first stop until its place is known.
+        let first_unknown = trip.stops.first().is_some_and(|s| s.position.is_none());
         self.next_stop = match near {
+            Some((k, _)) if first_unknown && k > 0 => 0,
             Some((k, _)) => k,
             // a trip the player picked is driven from its first stop, late as it may be
             None if self.picked => self.next_stop,
@@ -4493,7 +4687,9 @@ impl PlayerDuty {
         };
         // standing at a stop of it, the bus is on its way (as if it had left the stop before
         // on time); elsewhere the duty goes on with the next trip when that is due
-        self.left_late = near.map(|_| 0.0);
+        self.left_late = near
+            .filter(|&(k, _)| !(first_unknown && k > 0))
+            .map(|_| 0.0);
         log::info!(
             "duty: the bus starts {} trip {} ({}) under way, next stop {} '{}'",
             if near.is_some() {
@@ -4753,17 +4949,30 @@ impl PlayerDuty {
     fn feed_host(&self, bus: &mut omsi_sim::VehicleInstance, day_time: f64) {
         let delay = self.delay(day_time);
         let trip = &self.trips[self.trip_index];
-        let host = &mut bus.host;
-        host.tt_line = trip.line.clone();
-        host.tt_stops = trip
-            .stops
-            .iter()
-            .map(|s| (s.name.clone(), s.arr as f32, s.dep as f32))
-            .collect();
-        host.tt_stop_ids = trip.stops.iter().map(|s| s.object_id).collect();
-        host.tt_busstop_index = self.next_stop as i32;
-        host.tt_terminus_index = tt_terminus_index(host.hof.as_deref(), &trip.terminus);
-        host.tt_delay = delay as f32;
+        let prev_tt = bus.host.tt_busstop_index;
+        let stop_name = trip.stops.get(self.next_stop).map(|s| s.name.clone());
+        {
+            let host = &mut bus.host;
+            host.tt_line = trip.line.clone();
+            host.tt_stops = trip
+                .stops
+                .iter()
+                .map(|s| (s.name.clone(), s.arr as f32, s.dep as f32))
+                .collect();
+            host.tt_stop_ids = trip.stops.iter().map(|s| s.object_id).collect();
+            host.tt_busstop_index = self.next_stop as i32;
+            host.tt_terminus_index = tt_terminus_index(host.hof.as_deref(), &trip.terminus);
+            host.tt_delay = delay as f32;
+        }
+        // Aachen's ibox keeps its own stop counter and does `+ 1` when
+        // `GetTTBusstopIndex` changes. A jump of more than one stop, or a unit that only
+        // has `ibox_busstop`, left that counter behind the timetable - the announcement
+        // used the new TT name while the list still showed the old `ibox_busstop` row.
+        if self.next_stop as i32 != prev_tt {
+            if let Some(name) = stop_name.as_deref() {
+                sync_script_busstop(bus, self.next_stop, name, prev_tt);
+            }
+        }
     }
 
     /// The bus came to a later stop of the trip than the one it is due at (it drove past
@@ -5542,6 +5751,116 @@ pub(crate) mod tests {
             first_update: None,
             heading: 90.0,
         }
+    }
+
+    /// Aachen's ibox only has `ibox_busstop` and does `+ 1` when the TT index changes. A
+    /// jump of several stops must pre-position that counter so the `+ 1` lands on the new
+    /// stop - otherwise the list stays behind the announcement.
+    #[test]
+    fn ibox_busstop_is_prepositioned_when_the_timetable_jumps() {
+        let stops = ["Elsternplatz", "Bhf. Nordspitze", "Nordsp. Bauernhof"];
+        let mut hof = omsi_vehicle::Hof::default();
+        for s in stops {
+            hof.bus_stops.push(omsi_vehicle::hof::BusStop {
+                ident: s.into(),
+                strings: vec![s.into(), s.into(), s.into(), s.into()],
+            });
+        }
+        hof.info_busstop_lists.push(stops.iter().map(|s| s.to_string()).collect());
+        let mut bus = script_test_vehicle(
+            "{frame}\n{end}\n",
+            "ibox_busstop\nibox_routenindex\nibox_TTBusstopIndexLAST\n",
+            "",
+        );
+        bus.host.hof = Some(std::sync::Arc::new(hof));
+        bus.set_var("ibox_routenindex", 0.0);
+        bus.set_var("ibox_busstop", 0.0);
+        bus.host.tt_busstop_index = 0;
+        let planned_stops: Vec<PlannedStop> = stops
+            .iter()
+            .enumerate()
+            .map(|(i, name)| PlannedStop {
+                object_id: i as i64,
+                name: (*name).into(),
+                arr: i as f64 * 60.0,
+                dep: i as f64 * 60.0,
+                position: Some(glam::DVec3::new(i as f64 * 100.0, 0.0, 0.0)),
+                dir: StopDir::default(),
+                stops: true,
+            })
+            .collect();
+        let mut duty = PlayerDuty {
+            line: "76".into(),
+            tour: "2".into(),
+            trips: vec![PlannedTrip {
+                name: "76_2".into(),
+                line: "76".into(),
+                terminus: "Nordsp. Bauernhof".into(),
+                departure: 0.0,
+                end: planned_stops.last().unwrap().arr,
+                stops: planned_stops,
+            }],
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            served_terminus: None,
+            left_late: None,
+            held_back: false,
+            placed: true,
+            trip_changed: false,
+            skipped: None,
+            picked: true,
+            first_update: None,
+            heading: 90.0,
+        };
+        // jump from the first stop to the last: the script will +1 once, so leave 1 behind
+        duty.next_stop = 2;
+        duty.feed_host(&mut bus, 0.0);
+        assert_eq!(bus.host.tt_busstop_index, 2);
+        assert_eq!(bus.var("ibox_busstop"), Some(1.0), "pre-position for the script's +1");
+        // after the unit's own +1 the list and the announcement both show stop 2
+        bus.set_var("ibox_busstop", bus.var("ibox_busstop").unwrap() + 1.0);
+        assert_eq!(bus.var("ibox_busstop"), Some(2.0));
+    }
+
+    /// Aachen's Fahrplan list uses `GetTTBusstopIndex` as the highlighted (bottom) stop. At
+    /// the start of the line that must be 0. If only a later stop's place is loaded yet,
+    /// placing must not jump the index to that later stop.
+    #[test]
+    fn duty_place_keeps_first_stop_while_its_place_is_unknown() {
+        let mut trip = planned(100.0, &[(0.0, 100.0, 100.0), (20.0, 200.0, 200.0), (40.0, 300.0, 300.0)]);
+        trip.stops[0].position = None;
+        let mut d = PlayerDuty {
+            line: "33".into(),
+            tour: "1".into(),
+            trips: vec![trip],
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            served_terminus: None,
+            left_late: None,
+            held_back: false,
+            placed: true,
+            trip_changed: false,
+            skipped: None,
+            picked: true,
+            first_update: None,
+            heading: 90.0,
+        };
+        // late for the trip, standing at stop 2 whose place is known
+        d.place(glam::DVec3::new(20.0, 0.0, 0.0), 250.0);
+        assert_eq!(d.next_stop, 0, "do not highlight stop #2 while stop #1 has no place");
+        assert!(d.left_late.is_none());
+        let mut bus = timetable_test_vehicle();
+        d.feed_host(&mut bus, 250.0);
+        assert_eq!(bus.host.tt_busstop_index, 0);
+        assert_eq!(bus.host.tt_stops[0].0, "s0");
     }
 
     #[test]
